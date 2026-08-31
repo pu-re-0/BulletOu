@@ -309,6 +309,62 @@ __global__ void axpy_kernel(size_t len, float a, const float* x, const float* y,
     out[idx] = a * x[idx] + y[idx];
 }
 
+// Add d(lambda * macro_mean_stack L_struct) / dW to the already computed
+// SFNN L2 task gradients. H1 labels are per logical unit; column c maps to
+// c % l1_hidden, matching sfnn_l2_input_kernel's branch-major layout.
+__global__ void sfnn_softmod_l2_gradient_kernel(
+    const float* weights,
+    float* gradients,
+    const int* h1_labels,
+    const int* h2_labels,
+    const float* q_targets,
+    const float* q_floors,
+    const float* confidences,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    float lambda_struct,
+    float beta_floor,
+    float smooth_abs_eps) {
+    size_t stack = blockIdx.x;
+    if (stack >= num_stacks) return;
+    size_t l2_in = l1_hidden * 2;
+    size_t cells = l2_size * l2_in;
+    extern __shared__ float scratch[];
+    float* totals = scratch;
+    float* offs = scratch + blockDim.x;
+    float total = 0.0f, off = 0.0f;
+    size_t base = stack * cells;
+    for (size_t cell=threadIdx.x; cell<cells; cell+=blockDim.x) {
+        size_t row = cell / l2_in;
+        size_t col = cell - row*l2_in;
+        float w = weights[base+cell];
+        float mass = sqrtf(w*w + smooth_abs_eps);
+        total += mass;
+        if (h1_labels[stack*l1_hidden + (col % l1_hidden)] != h2_labels[stack*l2_size + row]) off += mass;
+    }
+    totals[threadIdx.x]=total; offs[threadIdx.x]=off;
+    __syncthreads();
+    for (unsigned stride=blockDim.x/2; stride>0; stride>>=1) {
+        if (threadIdx.x < stride) { totals[threadIdx.x]+=totals[threadIdx.x+stride]; offs[threadIdx.x]+=offs[threadIdx.x+stride]; }
+        __syncthreads();
+    }
+    total=totals[0]; off=offs[0];
+    if (!(total > 0.0f) || confidences[stack] <= 0.0f || lambda_struct == 0.0f) return;
+    float q=off/total;
+    float upper=fmaxf(0.0f,q-q_targets[stack]);
+    float floor=fmaxf(0.0f,q_floors[stack]-q);
+    float dloss_dq=confidences[stack]*(2.0f*upper-2.0f*beta_floor*floor);
+    float scale=lambda_struct*dloss_dq/(float(num_stacks)*total*total);
+    for (size_t cell=threadIdx.x; cell<cells; cell+=blockDim.x) {
+        size_t row=cell/l2_in, col=cell-row*l2_in;
+        float w=weights[base+cell], mass=sqrtf(w*w+smooth_abs_eps);
+        bool is_off=h1_labels[stack*l1_hidden+(col%l1_hidden)] != h2_labels[stack*l2_size+row];
+        float dq_dmass=(is_off ? total-off : -off);
+        gradients[base+cell] += scale*dq_dmass*(w/mass);
+    }
+}
+
 __global__ void fill_f32_kernel(size_t len, float value, float* out) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= len) {
@@ -6194,6 +6250,55 @@ extern "C" int bulletou_cuda_cpp_axpy_device(
     if (check_kernel_launch("axpy_kernel launch") != 0) {
         return -1;
     }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_f32_copy_device(
+    BulletOuCudaCppContext* ctx,
+    const BulletOuCudaCppF32Buffer* src,
+    BulletOuCudaCppF32Buffer* dst,
+    size_t len) {
+    if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src), len, "f32 copy source") != 0 ||
+        validate_buffer(ctx, dst, len, "f32 copy destination") != 0) return -1;
+    if (set_context_device(ctx) != 0) return -1;
+    if (len == 0) return ok();
+    cudaError_t status = cudaMemcpyAsync(dst->ptr, src->ptr, len * sizeof(float), cudaMemcpyDeviceToDevice, ctx->stream);
+    if (status != cudaSuccess) return fail("cudaMemcpyAsync f32 device copy", status);
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_softmod_l2_gradient_device(
+    BulletOuCudaCppContext* ctx,
+    size_t l1_hidden,
+    size_t l2_size,
+    size_t num_stacks,
+    const BulletOuCudaCppF32Buffer* weights,
+    BulletOuCudaCppF32Buffer* gradients,
+    const BulletOuCudaCppI32Buffer* h1_labels,
+    const BulletOuCudaCppI32Buffer* h2_labels,
+    const BulletOuCudaCppF32Buffer* q_targets,
+    const BulletOuCudaCppF32Buffer* q_floors,
+    const BulletOuCudaCppF32Buffer* confidences,
+    float lambda_struct,
+    float beta_floor,
+    float smooth_abs_eps) {
+    size_t weight_len=num_stacks*l2_size*l1_hidden*2;
+    if (validate_buffer(ctx,const_cast<BulletOuCudaCppF32Buffer*>(weights),weight_len,"softmod weights") != 0 ||
+        validate_buffer(ctx,gradients,weight_len,"softmod gradients") != 0 ||
+        validate_i32_buffer(ctx,const_cast<BulletOuCudaCppI32Buffer*>(h1_labels),num_stacks*l1_hidden,"softmod h1 labels") != 0 ||
+        validate_i32_buffer(ctx,const_cast<BulletOuCudaCppI32Buffer*>(h2_labels),num_stacks*l2_size,"softmod h2 labels") != 0 ||
+        validate_buffer(ctx,const_cast<BulletOuCudaCppF32Buffer*>(q_targets),num_stacks,"softmod q targets") != 0 ||
+        validate_buffer(ctx,const_cast<BulletOuCudaCppF32Buffer*>(q_floors),num_stacks,"softmod q floors") != 0 ||
+        validate_buffer(ctx,const_cast<BulletOuCudaCppF32Buffer*>(confidences),num_stacks,"softmod confidences") != 0) return -1;
+    if (l1_hidden==0 || l2_size==0 || num_stacks==0 || !isfinite(lambda_struct) || !isfinite(beta_floor) || beta_floor<0 || !(smooth_abs_eps>0))
+        return fail_message("invalid SFNN softmod configuration");
+    if (set_context_device(ctx) != 0) return -1;
+    int threads=256;
+    size_t shared_bytes=2*threads*sizeof(float);
+    sfnn_softmod_l2_gradient_kernel<<<static_cast<int>(num_stacks),threads,shared_bytes,ctx->stream>>>(
+        weights->ptr,gradients->ptr,h1_labels->ptr,h2_labels->ptr,q_targets->ptr,q_floors->ptr,confidences->ptr,
+        l1_hidden,l2_size,num_stacks,lambda_struct,beta_floor,smooth_abs_eps);
+    if (check_kernel_launch("sfnn_softmod_l2_gradient_kernel launch") != 0) return -1;
     return ok();
 }
 

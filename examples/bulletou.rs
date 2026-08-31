@@ -100,6 +100,9 @@ use clap::{ArgAction, Parser, ValueEnum};
 #[cfg(feature = "cuda-cpp-backend")]
 use rayon::prelude::*;
 
+#[path = "support/soft_modularity.rs"]
+mod soft_modularity;
+
 // ----- eval-type ---------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -198,6 +201,14 @@ enum SfnnUpdateScopeArg {
     L3Only,
     BiasOnly,
     L3BiasOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum SoftmodModeArg { Off, RandomPartition, Adaptive }
+
+impl SoftmodModeArg {
+    fn cli_name(self)->&'static str {match self{Self::Off=>"off",Self::RandomPartition=>"random-partition",Self::Adaptive=>"adaptive"}}
 }
 
 impl SfnnUpdateScopeArg {
@@ -1256,6 +1267,22 @@ struct QuantizedTestArgs {
     #[arg(long, default_value = "2.0")]
     loss_pow_exp: f32,
 
+    /// Evaluate the exported network with the same shogi win-rate-model loss
+    /// used by the default SFNN trainer instead of sigmoid score MSE.
+    #[arg(long)]
+    win_rate_model: bool,
+
+    #[arg(long, default_value = "600")]
+    wrm_nnue2score: f32,
+    #[arg(long, default_value = "270")]
+    wrm_in_offset: f32,
+    #[arg(long, default_value = "340")]
+    wrm_in_scaling: f32,
+    #[arg(long, default_value = "270")]
+    wrm_target_offset: f32,
+    #[arg(long, default_value = "380")]
+    wrm_target_scaling: f32,
+
     /// Rounding mode for the SFNN feature-transform product.
     #[arg(long, value_enum, default_value = "floor")]
     quant_ft_round: QuantizedRoundMode,
@@ -1433,6 +1460,12 @@ impl AverageSfnnStateArgs {
             lambda: 1.0,
             scale: self.scale,
             loss_pow_exp: self.loss_pow_exp,
+            win_rate_model: false,
+            wrm_nnue2score: DEFAULT_WRM_NNUE2SCORE,
+            wrm_in_offset: DEFAULT_WRM_IN_OFFSET,
+            wrm_in_scaling: DEFAULT_WRM_IN_SCALING,
+            wrm_target_offset: DEFAULT_WRM_TARGET_OFFSET,
+            wrm_target_scaling: DEFAULT_WRM_TARGET_SCALING,
             quant_ft_round: QuantizedRoundMode::Floor,
             quant_crelu_round: QuantizedRoundMode::Floor,
             quant_sqrcrelu_round: QuantizedRoundMode::Floor,
@@ -1608,6 +1641,12 @@ impl QuantizedCalibrateArgs {
             lambda: self.lambda,
             scale: self.scale,
             loss_pow_exp: self.loss_pow_exp,
+            win_rate_model: false,
+            wrm_nnue2score: DEFAULT_WRM_NNUE2SCORE,
+            wrm_in_offset: DEFAULT_WRM_IN_OFFSET,
+            wrm_in_scaling: DEFAULT_WRM_IN_SCALING,
+            wrm_target_offset: DEFAULT_WRM_TARGET_OFFSET,
+            wrm_target_scaling: DEFAULT_WRM_TARGET_SCALING,
             quant_ft_round: self.quant_ft_round,
             quant_crelu_round: self.quant_crelu_round,
             quant_sqrcrelu_round: self.quant_sqrcrelu_round,
@@ -3333,6 +3372,12 @@ struct Args {
     #[arg(long)]
     initial_state: Option<PathBuf>,
 
+    /// Write the deterministic SFNN scratch weights and zero-step Ranger
+    /// state to this directory, then exit before reading a teacher batch.
+    /// The resulting `weights.bin` can be shared by paired experiment arms.
+    #[arg(long)]
+    cuda_cpp_export_initial_state: Option<PathBuf>,
+
     /// Explicit teacher dataloader position file used when branching a new
     /// experiment from `--initial-state`. Format is the same as checkpoint
     /// `dataloader_pos.txt`: `<byte_offset>,<plies>`.
@@ -3391,6 +3436,26 @@ struct Args {
     /// rises briefly and then collapses.
     #[arg(long, value_enum, default_value = "all")]
     sfnn_update_scope: SfnnUpdateScopeArg,
+
+    /// Training-only H1->H2 soft modularity. Exported inference is unchanged.
+    #[arg(long, value_enum, default_value="off")]
+    softmod_mode: SoftmodModeArg,
+    #[arg(long, default_value_t=16)] softmod_n_null_surrogates: usize,
+    #[arg(long, default_value_t=0.05)] softmod_gain_min: f64,
+    #[arg(long, default_value_t=0.15)] softmod_gain_full: f64,
+    #[arg(long, default_value_t=0.18)] softmod_g_target: f64,
+    #[arg(long, default_value_t=0.60)] softmod_g_max: f64,
+    #[arg(long, default_value_t=4.0)] softmod_beta_floor: f64,
+    #[arg(long, default_value_t=0.03)] softmod_target_grad_ratio: f64,
+    #[arg(long, default_value_t=0.10)] softmod_warmup_fraction: f64,
+    #[arg(long, default_value_t=0.70)] softmod_freeze_fraction: f64,
+    #[arg(long, default_value_t=0.90)] softmod_relax_fraction: f64,
+    #[arg(long, default_value_t=5000)] softmod_refresh_steps: usize,
+    #[arg(long, default_value_t=3)] softmod_patience_refreshes: usize,
+    #[arg(long, default_value_t=1e-8)] softmod_lambda_min: f64,
+    #[arg(long, default_value_t=1e4)] softmod_lambda_max: f64,
+    #[arg(long, default_value_t=0.9)] softmod_lambda_ema: f64,
+    #[arg(long, default_value_t=20260819)] softmod_seed: u64,
 
     /// Print CPU teacher batch preparation time for the Windows-native
     /// C++/CUDA backend. This disables the prepared-batch producer queue
@@ -4065,6 +4130,19 @@ impl Args {
         ) {
             return Err(format!("--backend cuda-cpp does not support {} train steps", eval_type.cli_name()));
         }
+        if self.cuda_cpp_export_initial_state.is_some() {
+            if !eval_type.uses_layerstack() {
+                return Err("--cuda-cpp-export-initial-state requires an SFNN LayerStack architecture".to_string());
+            }
+            if self.initial_state.is_some() || self.resume {
+                return Err(
+                    "--cuda-cpp-export-initial-state cannot be combined with --initial-state or --resume".to_string()
+                );
+            }
+            if self.softmod_mode != SoftmodModeArg::Off {
+                return Err("--cuda-cpp-export-initial-state is a neutral step-0 checkpoint; use --softmod-mode off".to_string());
+            }
+        }
         if self.sfnn_factorized && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorized currently applies to SFNN / LayerStack eval types only".to_string());
         }
@@ -4094,6 +4172,17 @@ impl Args {
         }
         if self.sfnn_update_scope != SfnnUpdateScopeArg::All && !eval_type.uses_layerstack() {
             return Err("--sfnn-update-scope applies to SFNN / LayerStack eval types only".to_string());
+        }
+        if self.softmod_mode != SoftmodModeArg::Off {
+            if !eval_type.uses_layerstack() { return Err("--softmod-mode requires an SFNN LayerStack architecture".to_string()) }
+            let (_,h1,h2)=self.arch().dims();
+            if h1!=15 || h2!=64 { return Err(format!("--softmod-mode Stage 1 currently requires H1=15 and H2=64 (got H1={h1}, H2={h2})")) }
+            if effective_sfnn_factorizer_spec(self) != SfnnFactorizerSpec::NONE { return Err("--softmod-mode currently requires --sfnn-factorizer none so L2 effective weights equal the regularized base tensor".to_string()) }
+            if self.sfnn_update_scope != SfnnUpdateScopeArg::All { return Err("--softmod-mode requires --sfnn-update-scope all".to_string()) }
+            if self.batches_per_update != 1 { return Err("--softmod-mode currently requires --batches-per-update 1".to_string()) }
+            if self.lr_schedule == LrScheduleKind::Plateau { return Err("--softmod-mode does not yet support plateau rollback".to_string()) }
+            let cfg=soft_modularity::Config{mode:match self.softmod_mode{SoftmodModeArg::RandomPartition=>soft_modularity::Mode::RandomPartition,SoftmodModeArg::Adaptive=>soft_modularity::Mode::Adaptive,SoftmodModeArg::Off=>unreachable!()},seed:self.softmod_seed,total_steps:1,refresh_steps:self.softmod_refresh_steps,warmup_fraction:self.softmod_warmup_fraction,freeze_fraction:self.softmod_freeze_fraction,relax_fraction:self.softmod_relax_fraction,patience_refreshes:self.softmod_patience_refreshes,n_null:self.softmod_n_null_surrogates,gain_min:self.softmod_gain_min,gain_full:self.softmod_gain_full,g_target:self.softmod_g_target,g_max:self.softmod_g_max,beta_floor:self.softmod_beta_floor,target_grad_ratio:self.softmod_target_grad_ratio,lambda_min:self.softmod_lambda_min,lambda_max:self.softmod_lambda_max,lambda_ema:self.softmod_lambda_ema};
+            cfg.validate()?;
         }
         if !(self.loss_pow_exp.is_finite() && self.loss_pow_exp >= 1.0) {
             return Err(format!("--loss-pow-exp must be finite and >= 1 (got {})", self.loss_pow_exp));
@@ -5114,10 +5203,22 @@ impl QuantizedSfnnWeights {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Clone, Copy, Debug, Default)]
+struct QuantizedErrorStats {
+    mae: f32,
+    rmse: f32,
+    median_abs: f32,
+    p90_abs: f32,
+    p95_abs: f32,
+    p99_abs: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy, Debug, Default)]
 struct QuantizedTestReport {
     records: usize,
     engine_scale: AccuracyReport,
     train_scale: AccuracyReport,
+    engine_error: QuantizedErrorStats,
     elapsed: std::time::Duration,
 }
 
@@ -5194,12 +5295,39 @@ fn quantized_sfnn_raw_output_scale() -> f32 {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_train_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKind {
-    ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
+    if args.win_rate_model {
+        ValidationLossKind::WinRateModel {
+            pow_exp: args.loss_pow_exp,
+            nnue2score: args.wrm_nnue2score,
+            in_offset: args.wrm_in_offset,
+            in_scaling: args.wrm_in_scaling,
+            target: bulletou_lib::value::WinRateModelTargetParams {
+                offset: args.wrm_target_offset,
+                scaling: args.wrm_target_scaling,
+            },
+        }
+    } else {
+        ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_engine_scale_loss_kind(args: &QuantizedTestArgs) -> ValidationLossKind {
-    ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
+    if args.win_rate_model {
+        let raw_scale = quantized_sfnn_raw_output_scale();
+        ValidationLossKind::WinRateModel {
+            pow_exp: args.loss_pow_exp,
+            nnue2score: args.wrm_nnue2score * args.fv_scale as f32 / raw_scale,
+            in_offset: args.wrm_in_offset,
+            in_scaling: args.wrm_in_scaling,
+            target: bulletou_lib::value::WinRateModelTargetParams {
+                offset: args.wrm_target_offset,
+                scaling: args.wrm_target_scaling,
+            },
+        }
+    } else {
+        ValidationLossKind::SigmoidPow { pow_exp: args.loss_pow_exp }
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -5747,10 +5875,43 @@ fn quantized_test_report_from_outputs(
         quantized_train_scale_loss_kind(args),
     );
 
+    let mut absolute_errors = sample_mask
+        .loss_indices
+        .iter()
+        .map(|&i| (engine_outputs[i] - f32::from(teacher_scores[i])).abs())
+        .collect::<Vec<_>>();
+    absolute_errors.sort_by(f32::total_cmp);
+    let quantile = |q: f32| -> f32 {
+        if absolute_errors.is_empty() {
+            return f32::NAN;
+        }
+        let index = ((absolute_errors.len() as f32 * q).ceil() as usize).saturating_sub(1).min(absolute_errors.len() - 1);
+        absolute_errors[index]
+    };
+    let mae = absolute_errors.iter().sum::<f32>() / absolute_errors.len().max(1) as f32;
+    let rmse = sample_mask
+        .loss_indices
+        .iter()
+        .map(|&i| {
+            let error = engine_outputs[i] - f32::from(teacher_scores[i]);
+            error * error
+        })
+        .sum::<f32>();
+    let rmse = (rmse / absolute_errors.len().max(1) as f32).sqrt();
+    let engine_error = QuantizedErrorStats {
+        mae,
+        rmse,
+        median_abs: quantile(0.50),
+        p90_abs: quantile(0.90),
+        p95_abs: quantile(0.95),
+        p99_abs: quantile(0.99),
+    };
+
     Ok(QuantizedTestReport {
         records: positions.len(),
         engine_scale: engine_scale_report,
         train_scale: train_scale_report,
+        engine_error,
         elapsed: std::time::Duration::default(),
     })
 }
@@ -6108,15 +6269,25 @@ fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<Qu
             args.quant_sqrcrelu_round.cli_name(),
             args.quant_final_div_round.cli_name(),
         );
-        eprintln!(
-            "  loss              = {}",
+        let loss_label = if args.win_rate_model {
+            format!(
+                "win-rate-model(pow_exp={:.3}, nnue2score={:.3}, in={:.1}/{:.1}, target={:.1}/{:.1})",
+                args.loss_pow_exp,
+                args.wrm_nnue2score,
+                args.wrm_in_offset,
+                args.wrm_in_scaling,
+                args.wrm_target_offset,
+                args.wrm_target_scaling
+            )
+        } else {
             sigmoid_loss_label(
                 args.loss_pow_exp,
                 args.scale as f32,
                 args.fv_scale as f32,
-                quantized_train_scale_model_output_scale(args)
+                quantized_train_scale_model_output_scale(args),
             )
-        );
+        };
+        eprintln!("  loss              = {loss_label}");
         eprintln!(
             "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
             quantized_sfnn_raw_output_scale(),
@@ -6195,6 +6366,12 @@ fn quantized_test_args_from_training_args(args: &Args, nn_bin: PathBuf) -> Resul
         lambda: args.lambda,
         scale: scale.round() as u32,
         loss_pow_exp: effective_loss_pow_exp(args),
+        win_rate_model: effective_win_rate_model(args),
+        wrm_nnue2score: effective_wrm_nnue2score(args),
+        wrm_in_offset: effective_wrm_in_offset(args),
+        wrm_in_scaling: effective_wrm_in_scaling(args),
+        wrm_target_offset: effective_wrm_target_params(args).offset,
+        wrm_target_scaling: effective_wrm_target_params(args).scaling,
         quant_ft_round: QuantizedRoundMode::Floor,
         quant_crelu_round: QuantizedRoundMode::Floor,
         quant_sqrcrelu_round: QuantizedRoundMode::Floor,
@@ -7110,6 +7287,12 @@ fn main() {
                         report.train_scale.test_loss.unwrap_or(f32::NAN),
                         format_count(report.train_scale.loss_sampled)
                     );
+                    println!("  error_mae         = {:.6}", report.engine_error.mae);
+                    println!("  error_rmse        = {:.6}", report.engine_error.rmse);
+                    println!("  error_median_abs  = {:.6}", report.engine_error.median_abs);
+                    println!("  error_p90_abs     = {:.6}", report.engine_error.p90_abs);
+                    println!("  error_p95_abs     = {:.6}", report.engine_error.p95_abs);
+                    println!("  error_p99_abs     = {:.6}", report.engine_error.p99_abs);
                     println!(
                         "  elapsed           = {:.3}s ({}/sec)",
                         report.elapsed.as_secs_f64(),
@@ -9010,6 +9193,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     runner.warmup(&ctx).map_err(|e| e.to_string())?;
     print_startup_kv_colored("warmup", "done (NNUE dense-backward kernels)", ConsoleColor::BoldGreen);
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
+
     print_startup_kv_colored(
         "upload pipeline",
         format!("enabled ({}; 2 pinned slots; non-profiled steps)", feature_kind.source_label()),
@@ -10255,6 +10439,103 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     .map_err(|e| e.to_string())?;
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
+    if let Some(dir) = args.cuda_cpp_export_initial_state.as_deref() {
+        if initial_state.completed_steps != 0 {
+            return Err("--cuda-cpp-export-initial-state requires deterministic step-0 scratch initialization".to_string());
+        }
+        let weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+        let optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+        write_cuda_cpp_sfnn_direct_outputs(
+            dir,
+            feature_kind,
+            cuda_shape,
+            &weights,
+            &optimizer_states,
+            0,
+            0,
+            factorizer_spec,
+            effective_sfnn_factorizer_alpha(args),
+            sfnn_progress_params.as_ref(),
+        )?;
+        eprintln!("  cuda-cpp SFNN step-0 initial state = {}", dir.display());
+        return Ok(());
+    }
+
+    let mut softmod_controller = if args.softmod_mode == SoftmodModeArg::Off {
+        None
+    } else {
+        let mode = match args.softmod_mode {
+            SoftmodModeArg::Off => unreachable!(),
+            SoftmodModeArg::RandomPartition => soft_modularity::Mode::RandomPartition,
+            SoftmodModeArg::Adaptive => soft_modularity::Mode::Adaptive,
+        };
+        let cfg = soft_modularity::Config {
+            mode,
+            seed: args.softmod_seed,
+            total_steps: initial_state.completed_steps.saturating_add(train_steps),
+            refresh_steps: args.softmod_refresh_steps,
+            warmup_fraction: args.softmod_warmup_fraction,
+            freeze_fraction: args.softmod_freeze_fraction,
+            relax_fraction: args.softmod_relax_fraction,
+            patience_refreshes: args.softmod_patience_refreshes,
+            n_null: args.softmod_n_null_surrogates,
+            gain_min: args.softmod_gain_min,
+            gain_full: args.softmod_gain_full,
+            g_target: args.softmod_g_target,
+            g_max: args.softmod_g_max,
+            beta_floor: args.softmod_beta_floor,
+            target_grad_ratio: args.softmod_target_grad_ratio,
+            lambda_min: args.softmod_lambda_min,
+            lambda_max: args.softmod_lambda_max,
+            lambda_ema: args.softmod_lambda_ema,
+        };
+        print_startup_kv(
+            "soft modularity",
+            format!(
+                "{} (refresh={} steps, null={}, seed={})",
+                paint(args.softmod_mode.cli_name(), ConsoleColor::BoldGreen),
+                args.softmod_refresh_steps,
+                args.softmod_n_null_surrogates,
+                args.softmod_seed
+            ),
+        );
+        let state_path = args
+            .initial_state
+            .as_deref()
+            .or(auto_resume_state_bin.as_deref())
+            .and_then(std::path::Path::parent)
+            .map(|parent| parent.join("softmod-state.txt"));
+        let controller = if initial_state.completed_steps > 0 {
+            let path = state_path.ok_or_else(|| "softmod resume has no checkpoint directory".to_string())?;
+            if !path.is_file() {
+                return Err(format!(
+                    "softmod resume requires controller state: {}",
+                    path.display()
+                ));
+            }
+            print_startup_kv("softmod state", paint(path.display(), ConsoleColor::Cyan));
+            soft_modularity::Controller::load_state(cfg, cuda_shape.num_stacks, &path)?
+        } else {
+            soft_modularity::Controller::new(cfg, cuda_shape.num_stacks)?
+        };
+        Some(controller)
+    };
+
+    if let Some(controller) = softmod_controller.as_ref().filter(|_| initial_state.completed_steps > 0) {
+        let update = controller.current_update(initial_state.completed_steps);
+        let host = bulletou_cuda_cpp::SfnnSoftModularityHostConfig {
+            h1_labels: &update.h1_labels,
+            h2_labels: &update.h2_labels,
+            q_targets: &update.q_targets,
+            q_floors: &update.q_floors,
+            confidences: &update.confidences,
+            lambda_struct: update.lambda_struct,
+            beta_floor: update.beta_floor,
+            smooth_abs_eps: 1e-12,
+        };
+        runner.set_soft_modularity(&ctx, Some(&host)).map_err(|e| e.to_string())?;
+    }
+
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
     // Interpret f32 SFNN output through the same engine score scale that
     // exported nn.bin will use: score ~= output * QA * QB / FV_SCALE.
@@ -10527,6 +10808,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             dataloader_pos: accepted_dataloader_pos,
                         },
                     )?;
+                    if let Some(controller) = softmod_controller.as_ref() {
+                        controller.save_state(&checkpoint_dir.join("softmod-state.txt"))?;
+                    }
                     let save_elapsed = save_started.elapsed();
                     let checkpoint_elapsed = checkpoint_started.elapsed();
                     excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_elapsed);
@@ -10714,6 +10998,21 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut last_epoch_banner = None;
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
+        let global_step = completed_step_offset.saturating_add(seen_steps);
+        if softmod_controller.as_ref().is_some_and(|controller|controller.should_refresh(global_step)) {
+            ctx.synchronize().map_err(|e|e.to_string())?;
+            let weights=runner.read_weights(&ctx).map_err(|e|e.to_string())?;
+            let gradients=runner.read_l2_weight_gradients(&ctx).map_err(|e|e.to_string())?;
+            let controller=softmod_controller.as_mut().expect("checked above");
+            let update=controller.refresh(global_step,&weights.l2w,&gradients)?;
+            let host=bulletou_cuda_cpp::SfnnSoftModularityHostConfig{h1_labels:&update.h1_labels,h2_labels:&update.h2_labels,q_targets:&update.q_targets,q_floors:&update.q_floors,confidences:&update.confidences,lambda_struct:update.lambda_struct,beta_floor:update.beta_floor,smooth_abs_eps:1e-12};
+            runner.set_soft_modularity(&ctx,Some(&host)).map_err(|e|e.to_string())?;
+            let path=args.output_dir().join("module_history.jsonl");
+            if let Some(parent)=path.parent(){std::fs::create_dir_all(parent).map_err(|e|e.to_string())?}
+            let mut file=std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e|format!("failed to open {}: {e}",path.display()))?;
+            use std::io::Write as _;
+            for line in controller.drain_history(){writeln!(file,"{line}").map_err(|e|format!("failed to write {}: {e}",path.display()))?}
+        }
         last_dataloader_pos = teacher_batch.dataloader_pos;
         let progress_for_step = schedule.progress_for_step(seen_steps);
         print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
@@ -10908,6 +11207,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             dataloader_pos,
                         },
                     )?;
+                    if let Some(controller) = softmod_controller.as_ref() {
+                        controller.save_state(&checkpoint_dir.join("softmod-state.txt"))?;
+                    }
                     let save_elapsed = save_started.elapsed();
                     let checkpoint_elapsed = checkpoint_started.elapsed();
                     excluded_elapsed = excluded_elapsed.saturating_add(checkpoint_elapsed);
@@ -11249,6 +11551,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 dataloader_pos,
             },
         )?;
+        if let Some(controller) = softmod_controller.as_ref() {
+            controller.save_state(&checkpoint_dir.join("softmod-state.txt"))?;
+        }
         let save_elapsed = save_started.elapsed();
         let checkpoint_elapsed = final_readback_elapsed.saturating_add(checkpoint_started.elapsed());
         let progress = schedule.progress_for_step(seen_steps);
@@ -11310,6 +11615,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         effective_sfnn_factorizer_alpha(args),
         sfnn_progress_params.as_ref(),
     )?;
+    if let Some(controller) = softmod_controller.as_ref() {
+        controller.save_state(&direct_output_dir.join("softmod-state.txt"))?;
+    }
     eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
     if checkpoint_chunk_idx != schedule.chunks.len() {
         return Err(format!(
@@ -16429,6 +16737,23 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
+        format!("softmod_mode={}", args.softmod_mode.cli_name()),
+        format!("softmod_n_null_surrogates={}", args.softmod_n_null_surrogates),
+        format!("softmod_gain_min={:.9}", args.softmod_gain_min),
+        format!("softmod_gain_full={:.9}", args.softmod_gain_full),
+        format!("softmod_g_target={:.9}", args.softmod_g_target),
+        format!("softmod_g_max={:.9}", args.softmod_g_max),
+        format!("softmod_beta_floor={:.9}", args.softmod_beta_floor),
+        format!("softmod_target_grad_ratio={:.9}", args.softmod_target_grad_ratio),
+        format!("softmod_warmup_fraction={:.9}", args.softmod_warmup_fraction),
+        format!("softmod_freeze_fraction={:.9}", args.softmod_freeze_fraction),
+        format!("softmod_relax_fraction={:.9}", args.softmod_relax_fraction),
+        format!("softmod_refresh_steps={}", args.softmod_refresh_steps),
+        format!("softmod_patience_refreshes={}", args.softmod_patience_refreshes),
+        format!("softmod_lambda_min={:.12}", args.softmod_lambda_min),
+        format!("softmod_lambda_max={:.9}", args.softmod_lambda_max),
+        format!("softmod_lambda_ema={:.9}", args.softmod_lambda_ema),
+        format!("softmod_seed={}", args.softmod_seed),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={test_positions}"),
         format!("test_batch_size={}", args.test_batch_size),
@@ -16534,6 +16859,23 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_factorizer_residual_decay=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
     ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_l1=", "sfnn_update_scope=all");
+    ensure_line_after(&mut out, "softmod_mode=", "sfnn_update_scope=", "softmod_mode=off");
+    ensure_line_after(&mut out, "softmod_n_null_surrogates=", "softmod_mode=", "softmod_n_null_surrogates=16");
+    ensure_line_after(&mut out, "softmod_gain_min=", "softmod_n_null_surrogates=", "softmod_gain_min=0.050000000");
+    ensure_line_after(&mut out, "softmod_gain_full=", "softmod_gain_min=", "softmod_gain_full=0.150000000");
+    ensure_line_after(&mut out, "softmod_g_target=", "softmod_gain_full=", "softmod_g_target=0.180000000");
+    ensure_line_after(&mut out, "softmod_g_max=", "softmod_g_target=", "softmod_g_max=0.600000000");
+    ensure_line_after(&mut out, "softmod_beta_floor=", "softmod_g_max=", "softmod_beta_floor=4.000000000");
+    ensure_line_after(&mut out, "softmod_target_grad_ratio=", "softmod_beta_floor=", "softmod_target_grad_ratio=0.030000000");
+    ensure_line_after(&mut out, "softmod_warmup_fraction=", "softmod_target_grad_ratio=", "softmod_warmup_fraction=0.100000000");
+    ensure_line_after(&mut out, "softmod_freeze_fraction=", "softmod_warmup_fraction=", "softmod_freeze_fraction=0.700000000");
+    ensure_line_after(&mut out, "softmod_relax_fraction=", "softmod_freeze_fraction=", "softmod_relax_fraction=0.900000000");
+    ensure_line_after(&mut out, "softmod_refresh_steps=", "softmod_relax_fraction=", "softmod_refresh_steps=5000");
+    ensure_line_after(&mut out, "softmod_patience_refreshes=", "softmod_refresh_steps=", "softmod_patience_refreshes=3");
+    ensure_line_after(&mut out, "softmod_lambda_min=", "softmod_patience_refreshes=", "softmod_lambda_min=0.000000010000");
+    ensure_line_after(&mut out, "softmod_lambda_max=", "softmod_lambda_min=", "softmod_lambda_max=10000.000000000");
+    ensure_line_after(&mut out, "softmod_lambda_ema=", "softmod_lambda_max=", "softmod_lambda_ema=0.900000000");
+    ensure_line_after(&mut out, "softmod_seed=", "softmod_lambda_ema=", "softmod_seed=20260819");
 
     let mut normalized = out.join("\n");
     normalized.push('\n');

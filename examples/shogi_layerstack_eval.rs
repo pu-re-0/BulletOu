@@ -143,6 +143,10 @@ struct Args {
     #[arg(long)]
     dump_sfens: Option<PathBuf>,
 
+    /// Binary dump: bucket byte followed by PP, L2-input, and L2-ReLU activations.
+    #[arg(long)]
+    dump_activation_bin: Option<PathBuf>,
+
     /// Enable Threat concatenated input
     #[arg(long, default_value_t = false)]
     threat: bool,
@@ -660,6 +664,7 @@ fn main() {
             l2_size,
             threat_profile,
             use_hand_threat_defensive,
+            args.dump_activation_bin.as_deref(),
         );
         return;
     }
@@ -1811,6 +1816,7 @@ fn run_integer_forward(
     l2_size: usize,
     threat_profile: Option<ThreatProfile>,
     use_hand_threat_defensive: bool,
+    activation_dump: Option<&std::path::Path>,
 ) {
     let l1_effective = l1_size - 1;
     let l2_in_dim = l1_effective * 2;
@@ -1824,9 +1830,28 @@ fn run_integer_forward(
     let record_size = std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as u64;
     file.seek(SeekFrom::Start(offset * record_size)).unwrap();
 
-    println!("Architecture: {}", net.arch_str);
-    println!("fv_scale: {}", net.fv_scale);
-    println!();
+    let mut activation_writer = activation_dump.map(|path| {
+        let mut out = File::create(path).unwrap_or_else(|e| {
+            eprintln!("Error: Failed to create activation dump '{}': {e}", path.display());
+            std::process::exit(1);
+        });
+        out.write_all(b"NAGBIT01").unwrap();
+        out.write_all(&(l0_size as u32).to_le_bytes()).unwrap();
+        out.write_all(&(l2_in_dim as u32).to_le_bytes()).unwrap();
+        out.write_all(&(l2_size as u32).to_le_bytes()).unwrap();
+        out.write_all(&(samples as u64).to_le_bytes()).unwrap();
+        out
+    });
+    // Activation collection is a bulk-data path, not the interactive golden
+    // forward diagnostic.  Avoid formatting per-position diagnostics and all
+    // work after the last activation that is written.
+    let verbose = activation_writer.is_none();
+
+    if verbose {
+        println!("Architecture: {}", net.arch_str);
+        println!("fv_scale: {}", net.fv_scale);
+        println!();
+    }
 
     for sample_idx in 0..samples {
         let mut buf = [0u8; 40];
@@ -1837,7 +1862,7 @@ fn run_integer_forward(
         psv.as_bytes_mut().copy_from_slice(&buf);
 
         let decoded = psv.decode();
-        let sfen = board_to_sfen(&decoded, psv.game_ply());
+        let sfen = verbose.then(|| board_to_sfen(&decoded, psv.game_ply()));
         let bucket = bucket_impl.bucket(&psv) as usize;
         // HalfKA features のみ (Threat / HandThreat は別途処理)
         let (stm_features, nstm_features) = get_active_features(&psv, None);
@@ -1889,14 +1914,16 @@ fn run_integer_forward(
             (Vec::new(), Vec::new())
         };
 
-        println!("=== Integer Golden Forward (sample {}) ===", offset + sample_idx as u64);
-        println!("SFEN: {}", sfen);
-        println!("bucket_index: {}", bucket);
-        if net.has_threat {
-            println!("HalfKA features: {}, Threat features: {}", stm_features.len(), stm_threat.len());
-        }
-        if net.has_hand_threat {
-            println!("HalfKA features: {}, HandThreat features: {}", stm_features.len(), stm_hand_threat.len());
+        if verbose {
+            println!("=== Integer Golden Forward (sample {}) ===", offset + sample_idx as u64);
+            println!("SFEN: {}", sfen.as_deref().unwrap());
+            println!("bucket_index: {}", bucket);
+            if net.has_threat {
+                println!("HalfKA features: {}, Threat features: {}", stm_features.len(), stm_threat.len());
+            }
+            if net.has_hand_threat {
+                println!("HalfKA features: {}, HandThreat features: {}", stm_features.len(), stm_hand_threat.len());
+            }
         }
 
         // --- 1. Feature Transformer accumulation (i16) ---
@@ -1948,8 +1975,10 @@ fn run_integer_forward(
             }
         }
 
-        println!("FT acc[stm] first 8: {:?}", &acc_stm[..8]);
-        println!("FT acc[nstm] first 8: {:?}", &acc_nstm[..8]);
+        if verbose {
+            println!("FT acc[stm] first 8: {:?}", &acc_stm[..8]);
+            println!("FT acc[nstm] first 8: {:?}", &acc_nstm[..8]);
+        }
 
         // --- 2. SqrClippedReLU (Product Pooling): i16 → u8 ---
         // output[i] = (clamp(acc[i], 0, 127) * clamp(acc[i + half], 0, 127)) >> 7
@@ -1965,7 +1994,7 @@ fn run_integer_forward(
             pp_out[i + half] = ((a * b) >> 7) as u8;
         }
 
-        println!("PP out first 8: {:?}", &pp_out[..8]);
+        if verbose { println!("PP out first 8: {:?}", &pp_out[..8]); }
 
         // --- 3. L1: l0_size → l1_size (i32) ---
         let mut l1_out = vec![0i32; l1_size];
@@ -1986,7 +2015,7 @@ fn run_integer_forward(
         if net.has_hand_count {
             let hc_dims = net.hand_count_dims;
             let hand_count = hand_count_from_psv(&psv, hc_dims);
-            println!("HandCount input (dims={}): {:?}", hc_dims, hand_count);
+            if verbose { println!("HandCount input (dims={}): {:?}", hc_dims, hand_count); }
             for out in 0..l1_size {
                 let global_out = bucket * l1_size + out;
                 let mut partial: i32 = 0;
@@ -1998,9 +2027,9 @@ fn run_integer_forward(
             }
         }
 
-        println!("L1 out ({}): {:?}", l1_size, &l1_out);
+        if verbose { println!("L1 out ({}): {:?}", l1_size, &l1_out); }
         let l1_skip = l1_out[l1_effective];
-        println!("L1 skip: {}", l1_skip);
+        if verbose { println!("L1 skip: {}", l1_skip); }
 
         // --- 4. Split [l1_effective, 1] + Dual Activation → u8[l2_in_dim] ---
         let mut l2_in = vec![0u8; l2_in_dim];
@@ -2014,7 +2043,7 @@ fn run_integer_forward(
             l2_in[l1_effective + i] = (l1_out[i] >> 6).clamp(0, 127) as u8;
         }
 
-        println!("L2 input ({}): {:?}", l2_in_dim, &l2_in);
+        if verbose { println!("L2 input ({}): {:?}", l2_in_dim, &l2_in); }
 
         // --- 5. L2: l2_in_dim → l2_size (i32) + ClippedReLU → u8 ---
         let mut l2_raw = vec![0i32; l2_size];
@@ -2030,7 +2059,24 @@ fn run_integer_forward(
             l2_relu[out] = (l2_raw[out] >> 6).clamp(0, 127) as u8;
         }
 
-        println!("L2 out ({}): {:?}", l2_size, &l2_relu);
+        if verbose { println!("L2 out ({}): {:?}", l2_size, &l2_relu); }
+
+        if let Some(out) = activation_writer.as_mut() {
+            out.write_all(&[bucket as u8]).unwrap();
+            for values in [&pp_out[..], &l2_in[..], &l2_relu[..]] {
+                let mut packed = vec![0u8; values.len().div_ceil(8)];
+                for (i, &value) in values.iter().enumerate() {
+                    if value != 0 {
+                        packed[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                out.write_all(&packed).unwrap();
+            }
+        }
+
+        if !verbose {
+            continue;
+        }
 
         // --- 6. Output: l2_size → 1 + skip ---
         let mut output = net.l3_biases[bucket];

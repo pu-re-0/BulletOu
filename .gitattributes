@@ -1,0 +1,6 @@
+# Keep source and documentation stable across Windows, WSL, and Linux.
+* text=auto eol=lf
+
+# Windows command files require CRLF for compatibility with cmd.exe.
+*.bat text eol=crlf
+*.cmd text eol=crlf

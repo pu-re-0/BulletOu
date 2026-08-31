@@ -353,6 +353,18 @@ impl F32Buffer {
         })
     }
 
+    pub fn copy_from_device(&self, ctx: &Context, source: &F32Buffer) -> Result<()> {
+        if source.len != self.len {
+            return Err(CudaCppError::message(format!(
+                "device copy length mismatch: source={} destination={}",
+                source.len, self.len
+            )));
+        }
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_f32_copy_device(ctx.as_ptr(), source.as_ptr(), self.as_ptr(), self.len)
+        })
+    }
+
     pub fn download(&self, ctx: &Context) -> Result<Vec<f32>> {
         let mut out = vec![0.0; self.len];
         self.download_prefix(ctx, &mut out)?;
@@ -480,6 +492,66 @@ pub fn axpy_host(device: i32, a: f32, x: &[f32], y: &[f32]) -> Result<Vec<f32>> 
 pub fn axpy_device(ctx: &Context, len: usize, a: f32, x: &F32Buffer, y: &F32Buffer, out: &F32Buffer) -> Result<()> {
     // SAFETY: backend validates buffer lengths and device ownership.
     check(unsafe { ffi::bulletou_cuda_cpp_axpy_device(ctx.as_ptr(), len, a, x.as_ptr(), y.as_ptr(), out.as_ptr()) })
+}
+
+#[derive(Debug, Clone)]
+pub struct SfnnSoftModularityHostConfig<'a> {
+    pub h1_labels: &'a [i32],
+    pub h2_labels: &'a [i32],
+    pub q_targets: &'a [f32],
+    pub q_floors: &'a [f32],
+    pub confidences: &'a [f32],
+    pub lambda_struct: f32,
+    pub beta_floor: f32,
+    pub smooth_abs_eps: f32,
+}
+
+#[derive(Debug)]
+pub struct SfnnSoftModularityDeviceConfig {
+    h1_labels: I32Buffer,
+    h2_labels: I32Buffer,
+    q_targets: F32Buffer,
+    q_floors: F32Buffer,
+    confidences: F32Buffer,
+    lambda_struct: f32,
+    beta_floor: f32,
+    smooth_abs_eps: f32,
+}
+
+impl SfnnSoftModularityDeviceConfig {
+    fn from_host(ctx: &Context, shape: SfnnForwardShape, host: &SfnnSoftModularityHostConfig<'_>) -> Result<Self> {
+        let h1_len=shape.num_stacks*shape.l1_hidden;
+        let h2_len=shape.num_stacks*shape.l2_size;
+        expect_len("softmod h1 labels",h1_len,host.h1_labels.len())?;
+        expect_len("softmod h2 labels",h2_len,host.h2_labels.len())?;
+        for (name,values) in [("q targets",host.q_targets),("q floors",host.q_floors),("confidences",host.confidences)] {
+            expect_len(name,shape.num_stacks,values.len())?;
+        }
+        if host.h1_labels.iter().chain(host.h2_labels).any(|&x| x != 0 && x != 1) {
+            return Err(CudaCppError::message("softmod labels must be binary"));
+        }
+        if !(host.lambda_struct.is_finite() && host.lambda_struct >= 0.0 && host.beta_floor.is_finite()
+            && host.beta_floor >= 0.0 && host.smooth_abs_eps.is_finite() && host.smooth_abs_eps > 0.0) {
+            return Err(CudaCppError::message("invalid softmod scalar configuration"));
+        }
+        if host.q_targets.iter().chain(host.q_floors).chain(host.confidences).any(|x| !x.is_finite()) {
+            return Err(CudaCppError::message("softmod per-stack values must be finite"));
+        }
+        Ok(Self {
+            h1_labels:I32Buffer::from_host(ctx,host.h1_labels)?, h2_labels:I32Buffer::from_host(ctx,host.h2_labels)?,
+            q_targets:F32Buffer::from_host(ctx,host.q_targets)?, q_floors:F32Buffer::from_host(ctx,host.q_floors)?,
+            confidences:F32Buffer::from_host(ctx,host.confidences)?, lambda_struct:host.lambda_struct,
+            beta_floor:host.beta_floor, smooth_abs_eps:host.smooth_abs_eps,
+        })
+    }
+
+    fn apply(&self,ctx:&Context,shape:SfnnForwardShape,weights:&F32Buffer,gradients:&F32Buffer)->Result<()> {
+        check(unsafe { ffi::bulletou_cuda_cpp_sfnn_softmod_l2_gradient_device(
+            ctx.as_ptr(),shape.l1_hidden,shape.l2_size,shape.num_stacks,weights.as_ptr(),gradients.as_ptr(),
+            self.h1_labels.as_ptr(),self.h2_labels.as_ptr(),self.q_targets.as_ptr(),self.q_floors.as_ptr(),
+            self.confidences.as_ptr(),self.lambda_struct,self.beta_floor,self.smooth_abs_eps,
+        )})
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5248,6 +5320,8 @@ pub struct SfnnTrainStepRunner {
     pub backward_workspace: SfnnBackwardWorkspace,
     pub upload_slots: Vec<SfnnTrainStepUploadSlot>,
     pub next_upload_slot: usize,
+    last_l2_task_gradients: F32Buffer,
+    soft_modularity: Option<SfnnSoftModularityDeviceConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5439,6 +5513,7 @@ impl SfnnTrainStepRunner {
         let backward_workspace =
             SfnnBackwardWorkspace::new(ctx, SfnnBackwardWorkspaceLayout::new(shape, batch_size, max_active))?;
         backward_workspace.zero_parameter_gradients(ctx)?;
+        let last_l2_task_gradients = F32Buffer::from_host(ctx, &vec![0.0; backward_workspace.l2w_gradients.len()])?;
         Ok(Self {
             shape,
             batch_size,
@@ -5461,7 +5536,18 @@ impl SfnnTrainStepRunner {
             backward_workspace,
             upload_slots,
             next_upload_slot: 0,
+            last_l2_task_gradients,
+            soft_modularity: None,
         })
+    }
+
+    pub fn set_soft_modularity(&mut self,ctx:&Context,config:Option<&SfnnSoftModularityHostConfig<'_>>)->Result<()> {
+        self.soft_modularity=config.map(|x|SfnnSoftModularityDeviceConfig::from_host(ctx,self.shape,x)).transpose()?;
+        Ok(())
+    }
+
+    pub fn read_l2_weight_gradients(&self,ctx:&Context)->Result<Vec<f32>> {
+        self.last_l2_task_gradients.download(ctx)
     }
 
     pub fn step(
@@ -6030,6 +6116,10 @@ impl SfnnTrainStepRunner {
         let l1_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L1)?;
         let l2_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L2)?;
         let l3_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L3)?;
+        self.last_l2_task_gradients.copy_from_device(ctx, &self.backward_workspace.l2w_gradients)?;
+        if let Some(softmod)=&self.soft_modularity {
+            softmod.apply(ctx,self.shape,&self.weights.l2w,&self.backward_workspace.l2w_gradients)?;
+        }
         update_param_group_with_lr_multiplier(
             ctx,
             params,
@@ -6731,6 +6821,28 @@ mod ffi {
             x: *mut BulletOuCudaCppF32Buffer,
             y: *mut BulletOuCudaCppF32Buffer,
             out: *mut BulletOuCudaCppF32Buffer,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_f32_copy_device(
+            ctx: *mut BulletOuCudaCppContext,
+            src: *mut BulletOuCudaCppF32Buffer,
+            dst: *mut BulletOuCudaCppF32Buffer,
+            len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_softmod_l2_gradient_device(
+            ctx: *mut BulletOuCudaCppContext,
+            l1_hidden: usize,
+            l2_size: usize,
+            num_stacks: usize,
+            weights: *mut BulletOuCudaCppF32Buffer,
+            gradients: *mut BulletOuCudaCppF32Buffer,
+            h1_labels: *mut BulletOuCudaCppI32Buffer,
+            h2_labels: *mut BulletOuCudaCppI32Buffer,
+            q_targets: *mut BulletOuCudaCppF32Buffer,
+            q_floors: *mut BulletOuCudaCppF32Buffer,
+            confidences: *mut BulletOuCudaCppF32Buffer,
+            lambda_struct: f32,
+            beta_floor: f32,
+            smooth_abs_eps: f32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_nnue_forward_device(
             ctx: *mut BulletOuCudaCppContext,
@@ -7523,6 +7635,73 @@ mod tests {
     fn axpy_gpu_smoke() {
         let out = axpy_host(0, 2.0, &[1.0, 2.0, 3.0], &[10.0, 20.0, 30.0]).unwrap();
         assert_eq!(out, vec![12.0, 24.0, 36.0]);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_softmod_gradient_matches_finite_difference() {
+        let shape = tiny_sfnn_shape();
+        let weights = vec![
+            0.20, -0.30, 0.40, -0.50, 0.60, 0.70, -0.80, 0.90,
+            -0.15, 0.25, 0.35, -0.45, 0.55, -0.65, 0.75, 0.85,
+        ];
+        let h1_labels = [0, 1, 0, 1];
+        let h2_labels = [0, 1, 0, 1];
+        let q_targets = [0.05, 0.05];
+        let q_floors = [0.0, 0.0];
+        let confidences = [1.0, 0.7];
+        let lambda = 0.4;
+        let smooth_abs_eps = 1.0e-6;
+        let host = SfnnSoftModularityHostConfig {
+            h1_labels: &h1_labels,
+            h2_labels: &h2_labels,
+            q_targets: &q_targets,
+            q_floors: &q_floors,
+            confidences: &confidences,
+            lambda_struct: lambda,
+            beta_floor: 4.0,
+            smooth_abs_eps,
+        };
+        let ctx = Context::new(0).unwrap();
+        let device_weights = F32Buffer::from_host(&ctx, &weights).unwrap();
+        let device_gradients = F32Buffer::from_host(&ctx, &vec![0.0; weights.len()]).unwrap();
+        let config = SfnnSoftModularityDeviceConfig::from_host(&ctx, shape, &host).unwrap();
+        config.apply(&ctx, shape, &device_weights, &device_gradients).unwrap();
+        let actual = device_gradients.download(&ctx).unwrap();
+
+        let loss = |values: &[f32]| -> f64 {
+            let mut result = 0.0;
+            for stack in 0..shape.num_stacks {
+                let base = stack * shape.l2_size * shape.l1_hidden * 2;
+                let mut total = 0.0;
+                let mut off = 0.0;
+                for row in 0..shape.l2_size {
+                    for col in 0..shape.l1_hidden * 2 {
+                        let weight = f64::from(values[base + row * shape.l1_hidden * 2 + col]);
+                        let mass = (weight * weight + f64::from(smooth_abs_eps)).sqrt();
+                        total += mass;
+                        if h1_labels[stack * shape.l1_hidden + col % shape.l1_hidden]
+                            != h2_labels[stack * shape.l2_size + row]
+                        {
+                            off += mass;
+                        }
+                    }
+                }
+                let upper = (off / total - f64::from(q_targets[stack])).max(0.0);
+                result += f64::from(confidences[stack]) * upper * upper;
+            }
+            f64::from(lambda) * result / shape.num_stacks as f64
+        };
+        let delta = 1.0e-3_f32;
+        let mut expected = Vec::with_capacity(weights.len());
+        for index in 0..weights.len() {
+            let mut plus = weights.clone();
+            let mut minus = weights.clone();
+            plus[index] += delta;
+            minus[index] -= delta;
+            expected.push(((loss(&plus) - loss(&minus)) / (2.0 * f64::from(delta))) as f32);
+        }
+        assert_close_slice("softmod finite difference", &actual, &expected, 2.0e-4);
     }
 
     #[test]
