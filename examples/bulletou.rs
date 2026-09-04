@@ -12454,9 +12454,22 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
         if !gradients_device.iter().all(|&g| g == 0.0) {
             return Err(format!("cuda-cpp persistent ranger smoke did not reset gradients: {gradients_device:?}"));
         }
-        if weights_device != weights {
+        // CPU and CUDA may differ by a few f32 ULPs because the device path
+        // can fuse arithmetic. This smoke qualifies the same update, not
+        // bitwise identity across processors.
+        const RANGER_SMOKE_ABS_TOLERANCE: f32 = 1.0e-6;
+        let max_abs_delta = weights_device
+            .iter()
+            .zip(&weights)
+            .map(|(&device, &host)| (device - host).abs())
+            .fold(0.0_f32, f32::max);
+        if weights_device.len() != weights.len()
+            || !max_abs_delta.is_finite()
+            || max_abs_delta > RANGER_SMOKE_ABS_TOLERANCE
+        {
             return Err(format!(
-                "cuda-cpp persistent ranger smoke mismatch: host={weights:?} device={weights_device:?}"
+                "cuda-cpp persistent ranger smoke mismatch: max_abs_delta={max_abs_delta} \
+                 tolerance={RANGER_SMOKE_ABS_TOLERANCE} host={weights:?} device={weights_device:?}"
             ));
         }
 
