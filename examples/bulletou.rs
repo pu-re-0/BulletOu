@@ -67,10 +67,10 @@ const FT_HASH_SFNN_LEGACY_SUISHO11PLUS: u32 = 0x5F1348B8;
 const NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS: u32 = 0x633376A4;
 
 #[cfg(feature = "cuda-cpp-backend")]
-const NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE: u32 = 0xD18175F5;
+const NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE: u32 = 0xC199BC6A;
 
 #[cfg(feature = "cuda-cpp-backend")]
-const KHASH_SFNN_BAND2_BLOCK_PERMUTE: u32 = 0x8E923F4D;
+const KHASH_SFNN_BAND2_BLOCK_PERMUTE: u32 = 0x9E8AF6D2;
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_network_hash(arch: NnueArch) -> u32 {
@@ -7222,6 +7222,15 @@ fn quantized_sfnn_ft_pair_value(sum0: i32, sum1: i32, ft_shift: u32, round: Quan
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn quantized_band2_block(original: [u8; 4]) -> [u8; 4] {
+    std::array::from_fn(|offset| {
+        let low = original[offset].min(63);
+        let high = original[(offset + 1) % 4].saturating_sub(63).min(63);
+        ((u16::from(low) + u16::from(high)) / 2) as u8
+    })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn quantized_sfnn_clipped_relu(value: i32, round: QuantizedRoundMode) -> u8 {
     let shifted = match round {
         QuantizedRoundMode::Floor => value >> 6,
@@ -7324,11 +7333,7 @@ fn quantized_sfnn_forward_sample(
                     state.ft[base + block + 2],
                     state.ft[base + block + 3],
                 ];
-                for offset in 0..4 {
-                    let low = original[offset].min(127);
-                    let high = original[(offset + 1) % 4].saturating_sub(127).min(127);
-                    state.ft[base + block + offset] = ((u16::from(low) + u16::from(high)) / 2) as u8;
-                }
+                state.ft[base + block..base + block + 4].copy_from_slice(&quantized_band2_block(original));
             }
         }
     }
@@ -20974,7 +20979,7 @@ fn load_cuda_cpp_sfnn_initial_state(
 
     let requested_band2 = args.arch().band2_block_permute;
     match weights_records.remove("band2_block_permute") {
-        Some(marker) if marker.as_slice() == [if requested_band2 { 1.0 } else { 0.0 }] => {}
+        Some(marker) if marker.as_slice() == [if requested_band2 { 2.0 } else { 0.0 }] => {}
         Some(marker) => {
             return Err(format!(
                 "SFNN state {} band2_block_permute marker {:?} does not match --arch {}",
@@ -23288,7 +23293,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
 ) -> Result<(), String> {
     let completed_steps_record = [completed_steps as f32];
     let optimizer_steps_record = [optimizer_steps as f32];
-    let band2_block_permute_record = [if band2_block_permute { 1.0 } else { 0.0 }];
+    let band2_block_permute_record = [if band2_block_permute { 2.0 } else { 0.0 }];
     let mut records: Vec<(&str, &[f32])> = vec![
         ("nnue/train/completed_steps", completed_steps_record.as_slice()),
         ("nnue/weights/band2_block_permute", band2_block_permute_record.as_slice()),
@@ -23518,7 +23523,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
 
     let file = std::fs::File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?;
     let mut writer = std::io::BufWriter::new(file);
-    let band_modifier = if shape.band2_block_permute { ";Band2BlockPermute=K2P127RotateLeft1Block4" } else { "" };
+    let band_modifier = if shape.band2_block_permute { ";Band2BlockPermute=K2P63of128RotateLeft1Block4" } else { "" };
     let arch = format!(
         "ModelType=SFNNWithoutPsqt;Features={}[{}->{}x2],Network=SFNN-{}{{LayerStack={}{}}}",
         feature_set.display_name(),
@@ -26668,6 +26673,15 @@ mod tests {
         assert!(NnueArch::from_str("SFNN_halfka2_2048_7_64_k3k3_band2_block_permute").is_err());
     }
 
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn quantized_pairwise_producer_reaches_high_band() {
+        let produced = quantized_sfnn_ft_pair_value(254, 254, 7, QuantizedRoundMode::Floor);
+        assert_eq!(produced, 126);
+        assert!(produced > 63, "reachable pairwise output must activate the high band");
+        assert_eq!(quantized_band2_block([produced, 0, 0, 0]), [31, 0, 0, 31]);
+    }
+
     #[test]
     fn kppt_black_perspective_component_flips_white_to_move() {
         assert_eq!(kppt_black_perspective_component(true, 12.5, 99.0), 12.5);
@@ -29063,6 +29077,36 @@ mod tests {
         assert!((args.lr_min - 0.0001).abs() < 1.0e-9);
         assert!(args.sfnn_dirty_bucket_update);
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn band2_launcher_settings_file_is_accepted_by_args_parser() {
+        use clap::Parser as _;
+
+        let path = std::env::temp_dir().join(format!("bulletou-band2-launcher-settings-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{
+              "teacher": "/teacher.bin",
+              "test_teacher": "/dev.bin",
+              "output": "/run/checkpoints",
+              "backend": "cuda-cpp",
+              "sfnn_factorizer": "shared",
+              "arch": "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute",
+              "no_resume": true
+            }"#,
+        )
+        .unwrap();
+        let expanded = expand_settings_file_args(vec![
+            OsString::from("bulletou"),
+            OsString::from("--settings-file"),
+            path.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        let args = Args::try_parse_from(expanded).unwrap();
+        assert_eq!(args.arch().cli_name(), "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute");
+        assert!(matches!(args.backend, BackendKind::CudaCpp));
         let _ = std::fs::remove_file(path);
     }
 

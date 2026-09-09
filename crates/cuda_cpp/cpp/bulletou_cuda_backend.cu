@@ -920,6 +920,7 @@ constexpr size_t SFNN_HALFKA2_BASE_INPUT_SIZE = 131949;
 constexpr size_t SFNN_HALFKA2_PIECE_INPUTS = 1629;
 constexpr size_t SFNN_HALFKA2_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
 constexpr float SFNN_PAIRWISE_SCALE = 127.0f / 128.0f;
+constexpr float SFNN_BAND2_WIDTH = 63.0f / 128.0f;
 
 bool sfnn_is_grouped_l1_shape(size_t l1_group_count) {
     return l1_group_count > 1;
@@ -1053,8 +1054,9 @@ __global__ void sfnn_band2_block_permute_forward_kernel(
         activations[base + index] * activations[base + pairwise + index] * SFNN_PAIRWISE_SCALE;
     const float next_value =
         activations[base + next] * activations[base + pairwise + next] * SFNN_PAIRWISE_SCALE;
-    const float low = fminf(fmaxf(current_value, 0.0f), 1.0f);
-    const float rotated_high = fminf(fmaxf(next_value - 1.0f, 0.0f), 1.0f);
+    const float low = fminf(fmaxf(current_value, 0.0f), SFNN_BAND2_WIDTH);
+    const float rotated_high =
+        fminf(fmaxf(next_value - SFNN_BAND2_WIDTH, 0.0f), SFNN_BAND2_WIDTH);
     combined[base + perspective * pairwise + index] = 0.5f * (low + rotated_high);
 }
 
@@ -3627,13 +3629,13 @@ __global__ void sfnn_band2_pairwise_backward_kernel(
     const float nstm_value = nstm_l0[base + pair] * nstm_l0[base + pairwise + pair] * SFNN_PAIRWISE_SCALE;
     float stm_pair_grad = 0.0f;
     float nstm_pair_grad = 0.0f;
-    if (stm_value > 0.0f && stm_value < 1.0f)
+    if (stm_value > 0.0f && stm_value < SFNN_BAND2_WIDTH)
         stm_pair_grad += 0.5f * combined_gradients[base + pair];
-    if (stm_value > 1.0f && stm_value < 2.0f)
+    if (stm_value > SFNN_BAND2_WIDTH && stm_value < 2.0f * SFNN_BAND2_WIDTH)
         stm_pair_grad += 0.5f * combined_gradients[base + previous];
-    if (nstm_value > 0.0f && nstm_value < 1.0f)
+    if (nstm_value > 0.0f && nstm_value < SFNN_BAND2_WIDTH)
         nstm_pair_grad += 0.5f * combined_gradients[base + pairwise + pair];
-    if (nstm_value > 1.0f && nstm_value < 2.0f)
+    if (nstm_value > SFNN_BAND2_WIDTH && nstm_value < 2.0f * SFNN_BAND2_WIDTH)
         nstm_pair_grad += 0.5f * combined_gradients[base + pairwise + previous];
 
     stm_gradients[tid] = stm_pair_grad * stm_l0[base + mate_col] * SFNN_PAIRWISE_SCALE;
