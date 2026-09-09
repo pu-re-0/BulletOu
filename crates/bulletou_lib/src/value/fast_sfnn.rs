@@ -24,6 +24,7 @@ pub struct SfnnForwardShape {
     pub l2_size: usize,
     pub num_stacks: usize,
     pub l1_group_count: usize,
+    pub band2_block_permute: bool,
 }
 
 pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
@@ -34,6 +35,7 @@ pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
     l2_size: 64,
     num_stacks: 9,
     l1_group_count: 1,
+    band2_block_permute: false,
 };
 
 pub const SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE: usize = HALFKA2_DIMENSIONS + PIECE_INPUTS;
@@ -445,6 +447,12 @@ impl<'a> SfnnForwardWeights<'a> {
             crelu_in_place(nstm_l0);
             pairwise_mul_scaled(stm_l0, &mut trace.combined[combined_start..combined_mid]);
             pairwise_mul_scaled(nstm_l0, &mut trace.combined[combined_mid..combined_end]);
+            if shape.band2_block_permute {
+                for perspective in [combined_start..combined_mid, combined_mid..combined_end] {
+                    let transformed = sfnn_band2_block_permute_float(&trace.combined[perspective.clone()])?;
+                    trace.combined[perspective].copy_from_slice(&transformed);
+                }
+            }
 
             let combined = &trace.combined[combined_start..combined_end];
             let l1 = &mut trace.l1[l1_start..l1_end];
@@ -626,6 +634,7 @@ mod tests {
             l2_size: 3,
             num_stacks: 2,
             l1_group_count: 1,
+            band2_block_permute: false,
         };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
@@ -749,6 +758,7 @@ mod tests {
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
+            band2_block_permute: false,
         };
 
         let err = shape.validate().unwrap_err();
@@ -798,6 +808,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn band2_is_connected_to_scalar_forward_between_pairwise_and_l1() {
+        let baseline_shape = SfnnForwardShape {
+            input_size: 4,
+            ft_size: 8,
+            l1_hidden: 2,
+            l1_skip: true,
+            l2_size: 2,
+            num_stacks: 2,
+            l1_group_count: 1,
+            band2_block_permute: false,
+        };
+        let mut band2_shape = baseline_shape;
+        band2_shape.band2_block_permute = true;
+        let make_weights = |shape| SfnnForwardOwnedWeights {
+            shape,
+            l0w: vec![0.0; shape.input_size * shape.ft_size],
+            l0b: vec![1.0, 1.0, 1.0, 1.0, 0.8, 0.8, 0.8, 0.8],
+            l1w: vec![0.0; shape.l1w_len()],
+            l1b: vec![0.0; shape.num_stacks * shape.l1_out()],
+            l2w: vec![0.0; shape.l2_in() * shape.num_stacks * shape.l2_size],
+            l2b: vec![0.0; shape.num_stacks * shape.l2_size],
+            l3w: vec![0.0; shape.l2_size * shape.num_stacks],
+            l3b: vec![0.0; shape.num_stacks],
+        };
+        let baseline = make_weights(baseline_shape).forward_batch_trace(&tiny_batch()).unwrap();
+        let band2 = make_weights(band2_shape).forward_batch_trace(&tiny_batch()).unwrap();
+        for sample in 0..2 {
+            let start = sample * band2_shape.ft_size;
+            let middle = start + band2_shape.pairwise_size();
+            let end = start + band2_shape.ft_size;
+            let mut expected = Vec::new();
+            expected.extend(sfnn_band2_block_permute_float(&baseline.combined[start..middle]).unwrap());
+            expected.extend(sfnn_band2_block_permute_float(&baseline.combined[middle..end]).unwrap());
+            assert_close_slice("band2 combined", &band2.combined[start..end], &expected);
+        }
+        assert_ne!(baseline.combined, band2.combined);
+    }
+
     fn tiny_shape() -> SfnnForwardShape {
         SfnnForwardShape {
             input_size: 4,
@@ -807,6 +856,7 @@ mod tests {
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
+            band2_block_permute: false,
         }
     }
 
@@ -825,7 +875,6 @@ mod tests {
     }
 
     fn tiny_weights(shape: SfnnForwardShape) -> SfnnForwardWeights<'static> {
-        assert_eq!(shape, tiny_shape());
         SfnnForwardWeights {
             shape,
             l0w: &[
