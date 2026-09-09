@@ -1032,6 +1032,32 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     combined[l0_base + pairwise + pair] = nstm0 * nstm1 * SFNN_PAIRWISE_SCALE;
 }
 
+__global__ void sfnn_band2_block_permute_forward_kernel(
+    const float* stm_l0,
+    const float* nstm_l0,
+    float* combined,
+    size_t batch,
+    size_t ft_size) {
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t pairwise = ft_size / 2;
+    const size_t total = batch * ft_size;
+    if (tid >= total) return;
+    const size_t sample = tid / ft_size;
+    const size_t col = tid % ft_size;
+    const size_t perspective = col / pairwise;
+    const size_t index = col % pairwise;
+    const size_t next = (index & ~size_t(3)) + ((index + 1) & 3);
+    const float* activations = perspective == 0 ? stm_l0 : nstm_l0;
+    const size_t base = sample * ft_size;
+    const float current_value =
+        activations[base + index] * activations[base + pairwise + index] * SFNN_PAIRWISE_SCALE;
+    const float next_value =
+        activations[base + next] * activations[base + pairwise + next] * SFNN_PAIRWISE_SCALE;
+    const float low = fminf(fmaxf(current_value, 0.0f), 1.0f);
+    const float rotated_high = fminf(fmaxf(next_value - 1.0f, 0.0f), 1.0f);
+    combined[base + perspective * pairwise + index] = 0.5f * (low + rotated_high);
+}
+
 __global__ void sfnn_fold_halfka2_l0w_kernel(
     const float* weights,
     float* folded_weights,
@@ -3578,6 +3604,42 @@ __global__ void sfnn_pairwise_backward_kernel(
         combined_gradients[combined_base + pairwise + pair] * nstm_l0[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
 }
 
+__global__ void sfnn_band2_pairwise_backward_kernel(
+    const float* stm_l0,
+    const float* nstm_l0,
+    const float* combined_gradients,
+    float* stm_gradients,
+    float* nstm_gradients,
+    size_t batch,
+    size_t ft_size) {
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = batch * ft_size;
+    if (tid >= total) return;
+    const size_t pairwise = ft_size / 2;
+    const size_t sample = tid / ft_size;
+    const size_t col = tid % ft_size;
+    const size_t pair = col % pairwise;
+    const size_t mate_col = col < pairwise ? pairwise + pair : pair;
+    const size_t previous = (pair & ~size_t(3)) + ((pair + 3) & 3);
+    const size_t base = sample * ft_size;
+
+    const float stm_value = stm_l0[base + pair] * stm_l0[base + pairwise + pair] * SFNN_PAIRWISE_SCALE;
+    const float nstm_value = nstm_l0[base + pair] * nstm_l0[base + pairwise + pair] * SFNN_PAIRWISE_SCALE;
+    float stm_pair_grad = 0.0f;
+    float nstm_pair_grad = 0.0f;
+    if (stm_value > 0.0f && stm_value < 1.0f)
+        stm_pair_grad += 0.5f * combined_gradients[base + pair];
+    if (stm_value > 1.0f && stm_value < 2.0f)
+        stm_pair_grad += 0.5f * combined_gradients[base + previous];
+    if (nstm_value > 0.0f && nstm_value < 1.0f)
+        nstm_pair_grad += 0.5f * combined_gradients[base + pairwise + pair];
+    if (nstm_value > 1.0f && nstm_value < 2.0f)
+        nstm_pair_grad += 0.5f * combined_gradients[base + pairwise + previous];
+
+    stm_gradients[tid] = stm_pair_grad * stm_l0[base + mate_col] * SFNN_PAIRWISE_SCALE;
+    nstm_gradients[tid] = nstm_pair_grad * nstm_l0[base + mate_col] * SFNN_PAIRWISE_SCALE;
+}
+
 __device__ void sfnn_atomic_add_l0w_gradient(
     float* gradients,
     size_t feature,
@@ -4630,6 +4692,7 @@ int validate_sfnn_shape(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -4840,6 +4903,7 @@ int launch_sfnn_forward_kernels(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -4904,6 +4968,7 @@ int launch_sfnn_forward_kernels(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -4962,6 +5027,20 @@ int launch_sfnn_forward_kernels(
         ft_size);
     if (check_kernel_launch("sfnn_sparse_l0_pairwise_concat_kernel launch") != 0) {
         return -1;
+    }
+
+    if (band2_block_permute != 0) {
+        if (pairwise % 4 != 0) {
+            return fail_message("SFNN band2 block permutation requires each perspective width divisible by 4");
+        }
+        if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_band2_block_permute_forward_kernel") != 0) {
+            return -1;
+        }
+        sfnn_band2_block_permute_forward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            stm_l0, nstm_l0, combined, batch, ft_size);
+        if (check_kernel_launch("sfnn_band2_block_permute_forward_kernel launch") != 0) {
+            return -1;
+        }
     }
 
     if (common_shard_l1) {
@@ -5163,6 +5242,7 @@ int launch_zero_sfnn_backward_parameter_gradients(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -5873,6 +5953,7 @@ int launch_sfnn_backward_kernels(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -5957,6 +6038,7 @@ int launch_sfnn_backward_kernels(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -5999,6 +6081,7 @@ int launch_sfnn_backward_kernels(
                 ft_size,
                 l1_hidden,
                 l1_skip,
+                band2_block_permute,
                 l2_size,
                 num_stacks,
                 l1_group_count,
@@ -6030,7 +6113,7 @@ int launch_sfnn_backward_kernels(
                 l3fb_gradients,
                 l3axw_gradients,
                 l3axb_gradients,
-                fuse_pairwise_l0 == 0 ? 1 : 0) != 0) {
+                (fuse_pairwise_l0 == 0 || band2_block_permute != 0) ? 1 : 0) != 0) {
             return -1;
         }
     }
@@ -6542,7 +6625,7 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
-    if (fuse_pairwise_l0 != 0) {
+    if (fuse_pairwise_l0 != 0 && band2_block_permute == 0) {
         if (launch_sfnn_inverse_index_l0_backward(
                 ctx,
                 stm_indices,
@@ -6564,9 +6647,14 @@ int launch_sfnn_backward_kernels(
         if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_pairwise_backward_kernel") != 0) {
             return -1;
         }
-        sfnn_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-            stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients, batch, ft_size);
-        if (check_kernel_launch("sfnn_pairwise_backward_kernel launch") != 0) {
+        if (band2_block_permute != 0) {
+            sfnn_band2_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients, batch, ft_size);
+        } else {
+            sfnn_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients, batch, ft_size);
+        }
+        if (check_kernel_launch("sfnn pairwise backward kernel launch") != 0) {
             return -1;
         }
 
@@ -8089,6 +8177,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -8161,6 +8250,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -8476,6 +8566,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -8556,6 +8647,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -8663,6 +8755,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -9338,6 +9431,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -9434,6 +9528,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -9554,6 +9649,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -9645,6 +9741,7 @@ int sfnn_backward_train_device_impl(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -9742,6 +9839,7 @@ int sfnn_backward_train_device_impl(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -9849,6 +9947,7 @@ int sfnn_backward_train_device_impl(
             ft_size,
             l1_hidden,
             l1_skip,
+            band2_block_permute,
             l2_size,
             num_stacks,
             l1_group_count,
@@ -9940,6 +10039,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -10045,6 +10145,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         ft_size,
         l1_hidden,
         l1_skip,
+        band2_block_permute,
         l2_size,
         num_stacks,
         l1_group_count,
@@ -10131,6 +10232,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     size_t ft_size,
     size_t l1_hidden,
     int l1_skip,
+    int band2_block_permute,
     size_t l2_size,
     size_t num_stacks,
     size_t l1_group_count,
@@ -10238,6 +10340,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         ft_size,
         l1_hidden,
         l1_skip,
+        band2_block_permute,
         l2_size,
         num_stacks,
         l1_group_count,

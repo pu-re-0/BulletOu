@@ -37,6 +37,72 @@ pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
 };
 
 pub const SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE: usize = HALFKA2_DIMENSIONS + PIECE_INPUTS;
+pub const SFNN_BAND2_BLOCK_SIZE: usize = 4;
+pub const SFNN_BAND2_FLOAT_WIDTH: f32 = 1.0;
+pub const SFNN_BAND2_INTEGER_WIDTH: u8 = 127;
+
+/// Applies Issue #11's fixed post-pairwise transform to one perspective.
+pub fn sfnn_band2_block_permute_float(values: &[f32]) -> Result<Vec<f32>, FastSfnnError> {
+    if values.len() % SFNN_BAND2_BLOCK_SIZE != 0 {
+        return Err(FastSfnnError::Shape(format!(
+            "band2 perspective length {} is not divisible by block size {}",
+            values.len(),
+            SFNN_BAND2_BLOCK_SIZE
+        )));
+    }
+    let mut output = vec![0.0; values.len()];
+    for block in (0..values.len()).step_by(SFNN_BAND2_BLOCK_SIZE) {
+        for offset in 0..SFNN_BAND2_BLOCK_SIZE {
+            let value = values[block + offset];
+            let next = values[block + (offset + 1) % SFNN_BAND2_BLOCK_SIZE];
+            let low = value.clamp(0.0, SFNN_BAND2_FLOAT_WIDTH);
+            let rotated_high = (next - SFNN_BAND2_FLOAT_WIDTH).clamp(0.0, SFNN_BAND2_FLOAT_WIDTH);
+            output[block + offset] = (low + rotated_high) * 0.5;
+        }
+    }
+    Ok(output)
+}
+
+pub fn sfnn_band2_block_permute_integer(values: &[u8]) -> Result<Vec<u8>, FastSfnnError> {
+    if values.len() % SFNN_BAND2_BLOCK_SIZE != 0 {
+        return Err(FastSfnnError::Shape(format!(
+            "band2 perspective length {} is not divisible by block size {}",
+            values.len(),
+            SFNN_BAND2_BLOCK_SIZE
+        )));
+    }
+    let mut output = vec![0; values.len()];
+    for block in (0..values.len()).step_by(SFNN_BAND2_BLOCK_SIZE) {
+        for offset in 0..SFNN_BAND2_BLOCK_SIZE {
+            let value = values[block + offset];
+            let next = values[block + (offset + 1) % SFNN_BAND2_BLOCK_SIZE];
+            let low = value.min(SFNN_BAND2_INTEGER_WIDTH);
+            let rotated_high = next.saturating_sub(SFNN_BAND2_INTEGER_WIDTH).min(SFNN_BAND2_INTEGER_WIDTH);
+            output[block + offset] = (u16::from(low) + u16::from(rotated_high)).div_euclid(2) as u8;
+        }
+    }
+    Ok(output)
+}
+
+pub fn sfnn_band2_block_permute_backward(values: &[f32], output_gradients: &[f32]) -> Result<Vec<f32>, FastSfnnError> {
+    if values.len() != output_gradients.len() || values.len() % SFNN_BAND2_BLOCK_SIZE != 0 {
+        return Err(FastSfnnError::Shape("band2 backward requires equal complete-block inputs".to_string()));
+    }
+    let mut gradients = vec![0.0; values.len()];
+    for block in (0..values.len()).step_by(SFNN_BAND2_BLOCK_SIZE) {
+        for offset in 0..SFNN_BAND2_BLOCK_SIZE {
+            let value = values[block + offset];
+            let previous = block + (offset + SFNN_BAND2_BLOCK_SIZE - 1) % SFNN_BAND2_BLOCK_SIZE;
+            if value > 0.0 && value < SFNN_BAND2_FLOAT_WIDTH {
+                gradients[block + offset] += 0.5 * output_gradients[block + offset];
+            }
+            if value > SFNN_BAND2_FLOAT_WIDTH && value < 2.0 * SFNN_BAND2_FLOAT_WIDTH {
+                gradients[block + offset] += 0.5 * output_gradients[previous];
+            }
+        }
+    }
+    Ok(gradients)
+}
 
 impl SfnnForwardShape {
     pub fn has_l1_skip(self) -> bool {
@@ -688,6 +754,39 @@ mod tests {
         let err = shape.validate().unwrap_err();
 
         assert!(matches!(err, FastSfnnError::Shape(message) if message.contains("ft_size")));
+    }
+
+    #[test]
+    fn band2_integer_contract_covers_boundaries_and_blocks() {
+        let input = [0, 1, 126, 127, 128, 254, 255, 255];
+        assert_eq!(
+            sfnn_band2_block_permute_integer(&input).unwrap(),
+            vec![0, 0, 63, 63, 127, 127, 127, 64]
+        );
+    }
+
+    #[test]
+    fn band2_backward_matches_finite_difference() {
+        let values = [0.2, 0.7, 1.2, 1.8];
+        let output_gradients = [0.3, -0.2, 0.7, 1.1];
+        let analytic = sfnn_band2_block_permute_backward(&values, &output_gradients).unwrap();
+        let objective = |xs: &[f32]| {
+            sfnn_band2_block_permute_float(xs)
+                .unwrap()
+                .iter()
+                .zip(output_gradients)
+                .map(|(value, gradient)| value * gradient)
+                .sum::<f32>()
+        };
+        let epsilon = 1.0e-3;
+        for index in 0..values.len() {
+            let mut plus = values;
+            let mut minus = values;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let numeric = (objective(&plus) - objective(&minus)) / (2.0 * epsilon);
+            assert!((numeric - analytic[index]).abs() < 2.0e-4, "index={index}: {numeric} != {}", analytic[index]);
+        }
     }
 
     fn tiny_shape() -> SfnnForwardShape {
