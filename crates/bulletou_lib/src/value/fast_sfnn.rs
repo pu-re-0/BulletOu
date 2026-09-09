@@ -38,8 +38,8 @@ pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
 
 pub const SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE: usize = HALFKA2_DIMENSIONS + PIECE_INPUTS;
 pub const SFNN_BAND2_BLOCK_SIZE: usize = 4;
-pub const SFNN_BAND2_FLOAT_WIDTH: f32 = 1.0;
-pub const SFNN_BAND2_INTEGER_WIDTH: u8 = 127;
+pub const SFNN_BAND2_FLOAT_WIDTH: f32 = 63.0 / 128.0;
+pub const SFNN_BAND2_INTEGER_WIDTH: u8 = 63;
 
 /// Applies Issue #11's fixed post-pairwise transform to one perspective.
 pub fn sfnn_band2_block_permute_float(values: &[f32]) -> Result<Vec<f32>, FastSfnnError> {
@@ -758,16 +758,25 @@ mod tests {
 
     #[test]
     fn band2_integer_contract_covers_boundaries_and_blocks() {
-        let input = [0, 1, 126, 127, 128, 254, 255, 255];
+        let input = [0, 1, 62, 63, 64, 125, 126, 127];
         assert_eq!(
             sfnn_band2_block_permute_integer(&input).unwrap(),
-            vec![0, 0, 63, 63, 127, 127, 127, 64]
+            vec![0, 0, 31, 31, 62, 63, 63, 32]
         );
     }
 
     #[test]
+    fn band2_pairwise_producer_reaches_scalar_high_band() {
+        let pairwise = |left: u8, right: u8| ((u16::from(left) * u16::from(right)) >> 7) as u8;
+        let input = [pairwise(127, 127), pairwise(96, 96), pairwise(64, 64), pairwise(0, 127)];
+        assert_eq!(input, [126, 72, 32, 0]);
+        assert!(input.iter().any(|&value| value > SFNN_BAND2_INTEGER_WIDTH));
+        assert_eq!(sfnn_band2_block_permute_integer(&input).unwrap(), vec![36, 31, 16, 31]);
+    }
+
+    #[test]
     fn band2_backward_matches_finite_difference() {
-        let values = [0.2, 0.7, 1.2, 1.8];
+        let values = [0.1, 0.3, 0.6, 0.9];
         let output_gradients = [0.3, -0.2, 0.7, 1.1];
         let analytic = sfnn_band2_block_permute_backward(&values, &output_gradients).unwrap();
         let objective = |xs: &[f32]| {
