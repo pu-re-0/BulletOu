@@ -4620,12 +4620,12 @@ int block_count_1d(size_t len, int threads, int* blocks, const char* label) {
     return 0;
 }
 
-constexpr size_t SFNN_BACKWARD_PROFILE_MS_LEN = 7;
+constexpr size_t SFNN_BACKWARD_PROFILE_MS_LEN = 9;
 
 struct SfnnBackwardProfileEvents {
     bool enabled = false;
     float* out_ms = nullptr;
-    cudaEvent_t events[7] = {};
+    cudaEvent_t events[8] = {};
 
     ~SfnnBackwardProfileEvents() {
         for (cudaEvent_t event : events) {
@@ -4640,14 +4640,14 @@ struct SfnnBackwardProfileEvents {
             return 0;
         }
         if (out_len < SFNN_BACKWARD_PROFILE_MS_LEN) {
-            return fail_message("SFNN backward profile output must have at least 7 floats");
+            return fail_message("SFNN backward profile output must have at least 9 floats");
         }
         enabled = true;
         out_ms = out;
         for (size_t i = 0; i < SFNN_BACKWARD_PROFILE_MS_LEN; ++i) {
             out_ms[i] = 0.0f;
         }
-        for (size_t i = 0; i < 7; ++i) {
+        for (size_t i = 0; i < 8; ++i) {
             cudaError_t status = cudaEventCreate(&events[i]);
             if (status != cudaSuccess) {
                 return fail("cudaEventCreate SFNN backward profile", status);
@@ -4683,6 +4683,8 @@ struct SfnnBackwardProfileEvents {
             {4, 5}, // L1 backward
             {5, 6}, // pairwise/L0 backward
             {0, 6}, // total backward
+            {5, 7}, // materialized pairwise backward (zeroed for inverse-index in Rust)
+            {7, 6}, // materialized sparse L0 backward (zeroed for inverse-index in Rust)
         };
         for (size_t i = 0; i < SFNN_BACKWARD_PROFILE_MS_LEN; ++i) {
             status = cudaEventElapsedTime(&out_ms[i], events[ranges[i][0]], events[ranges[i][1]]);
@@ -6655,6 +6657,7 @@ int launch_sfnn_backward_kernels(
     }
 
     if (fuse_pairwise_l0 != 0) {
+        if (profile.record(7, ctx, "SFNN inverse-index path boundary") != 0) return -1;
         if (launch_sfnn_inverse_index_l0_backward(
                 ctx,
                 stm_indices,
@@ -6689,6 +6692,7 @@ int launch_sfnn_backward_kernels(
             return -1;
         }
 
+        if (profile.record(7, ctx, "SFNN backward profile after pairwise") != 0) return -1;
         if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_l0_sparse_backward_kernel") != 0) {
             return -1;
         }

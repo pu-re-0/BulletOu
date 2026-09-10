@@ -3636,7 +3636,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
         _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
     };
 
-    let mut profile_ms = [0.0f32; 7];
+    let mut profile_ms = [0.0f32; 9];
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
     check(unsafe {
         ffi::bulletou_cuda_cpp_sfnn_backward_train_profile_device(
@@ -3734,6 +3734,8 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
         l2_input_ms: profile_ms[3],
         l1_ms: profile_ms[4],
         l0_ms: profile_ms[5],
+        pairwise_ms: if l0_backward_path == SfnnL0BackwardPath::MaterializedSparse { profile_ms[7] } else { 0.0 },
+        sparse_l0_ms: if l0_backward_path == SfnnL0BackwardPath::MaterializedSparse { profile_ms[8] } else { 0.0 },
         total_ms: profile_ms[6],
     })
 }
@@ -5439,6 +5441,9 @@ pub struct SfnnBackwardStageProfile {
     pub l2_input_ms: f32,
     pub l1_ms: f32,
     pub l0_ms: f32,
+    /// Individual materialized-path kernels; zero when that path was not executed.
+    pub pairwise_ms: f32,
+    pub sparse_l0_ms: f32,
     pub total_ms: f32,
 }
 
@@ -11020,6 +11025,169 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_two_microbatch_soft_progress_matches_cpu() {
+        let ctx = Context::new(0).unwrap();
+        let shape = tiny_sfnn_shape();
+        let weights = tiny_sfnn_weights(shape);
+        let stm = [0, 1, -1, 2, -1, -1, 1, 3, -1, 3, 2, -1];
+        let nstm = [2, -1, -1, 0, 3, -1, 0, -1, -1, 1, -1, -1];
+        let a = [0, 1, 0, 1];
+        let b = [1, 0, 1, 0];
+        let interpolation = [0.125, 0.375, 0.625, 0.875];
+        let entry_weights = [1.0, 0.5, 0.75, 1.25];
+        let targets = [[0.25, 0.75, 0.6, 0.1], [0.8, 0.3, 0.2, 0.9]];
+        let params = RangerUpdateParams {
+            radam: RAdamUpdateParams {
+                step: 1,
+                learning_rate: 0.01,
+                min_weight: -1.98,
+                max_weight: 1.98,
+                ..Default::default()
+            },
+            lookahead_alpha: 0.5,
+            lookahead_period: 6,
+        };
+        for soft in [false, true] {
+            let mut expected: Option<SfnnCpuBackward> = None;
+            for (micro, target) in targets.iter().enumerate() {
+                let (stm, nstm) = if micro == 0 { (&stm, &nstm) } else { (&nstm, &stm) };
+                let ba = SfnnForwardHostBatch {
+                    stm_indices: stm,
+                    nstm_indices: nstm,
+                    buckets: &a,
+                    batch_size: 4,
+                    max_active: 3,
+                };
+                let bb = SfnnForwardHostBatch { buckets: &b, ..ba };
+                let fa = tiny_sfnn_forward_trace_cpu(ba, weights);
+                let fb = tiny_sfnn_forward_trace_cpu(bb, weights);
+                let mut ga = [0.0; 4];
+                let mut gb = [0.0; 4];
+                for i in 0..4 {
+                    let t = if soft { interpolation[i] } else { 0.0 };
+                    let y = (1.0 - t) * fa.outputs[i] + t * fb.outputs[i];
+                    let p = sigmoid_cpu(y);
+                    let g = entry_weights[i] * 2.0 * (p - target[i]) * p * (1.0 - p) / 4.0;
+                    ga[i] = (1.0 - t) * g;
+                    gb[i] = t * g;
+                }
+                for (batch, grad) in [(ba, ga), (bb, gb)] {
+                    let rhs = tiny_sfnn_backward_cpu_with_output_gradients(batch, weights, &grad);
+                    if let Some(acc) = &mut expected {
+                        macro_rules! add { ($($f:ident),*) => { $(for (a,b) in acc.$f.iter_mut().zip(&rhs.$f) {*a+=b;})* }; }
+                        add!(
+                            l0w_gradients,
+                            l0b_gradients,
+                            l1w_gradients,
+                            l1b_gradients,
+                            l1fw_gradients,
+                            l1fb_gradients,
+                            l2w_gradients,
+                            l2b_gradients,
+                            l2fw_gradients,
+                            l2fb_gradients,
+                            l3w_gradients,
+                            l3b_gradients,
+                            l3fw_gradients,
+                            l3fb_gradients
+                        );
+                    } else {
+                        expected = Some(rhs);
+                    }
+                }
+            }
+            let expected = expected.unwrap();
+            let updated = host_ranger_updated_tiny_sfnn_weights(0, weights, &expected, params);
+            for selector in [SfnnL0BackwardSelector::Auto, SfnnL0BackwardSelector::MaterializedSparse] {
+                for apply_update in [false, true] {
+                    let mut r = SfnnTrainStepRunner::new_with_factorizer_and_l0_backward_selector(
+                        &ctx,
+                        weights,
+                        4,
+                        3,
+                        SfnnFactorizerActive::from_host(weights),
+                        SfnnFactorizerAlpha::ONE,
+                        selector,
+                    )
+                    .unwrap();
+                    for (micro, target) in targets.iter().enumerate() {
+                        let (stm, nstm) = if micro == 0 { (&stm, &nstm) } else { (&nstm, &stm) };
+                        if soft {
+                            r.step_soft_progress_no_readback_with_update_lr_multipliers_and_dirty_buckets(
+                                &ctx,
+                                params,
+                                ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+                                1.0,
+                                SfnnSoftProgressTrainStepHostBatch {
+                                    stm_indices: stm,
+                                    nstm_indices: nstm,
+                                    buckets_a: &a,
+                                    buckets_b: &b,
+                                    interpolation: &interpolation,
+                                    targets: target,
+                                    entry_weights: &entry_weights,
+                                    batch_size: 4,
+                                    max_active: 3,
+                                },
+                                apply_update && micro == 1,
+                                SfnnLayerLrMultipliers::default(),
+                                None,
+                            )
+                            .unwrap();
+                        } else {
+                            r.step_no_readback_with_loss_finalize_and_update(
+                                &ctx,
+                                params,
+                                ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+                                1.0,
+                                SfnnTrainStepHostBatch {
+                                    stm_indices: stm,
+                                    nstm_indices: nstm,
+                                    buckets: &a,
+                                    targets: target,
+                                    entry_weights: &entry_weights,
+                                    batch_size: 4,
+                                    max_active: 3,
+                                },
+                                true,
+                                apply_update && micro == 1,
+                            )
+                            .unwrap();
+                        }
+                    }
+                    if !apply_update {
+                        let actual = r.read_backward_trace(&ctx).unwrap();
+                        macro_rules! check { ($($f:ident),*) => { $(assert_close_slice(stringify!($f),&actual.$f,&expected.$f,1e-6);)* }; }
+                        check!(
+                            l0w_gradients,
+                            l0b_gradients,
+                            l1w_gradients,
+                            l1b_gradients,
+                            l1fw_gradients,
+                            l1fb_gradients,
+                            l2w_gradients,
+                            l2b_gradients,
+                            l2fw_gradients,
+                            l2fb_gradients,
+                            l3w_gradients,
+                            l3b_gradients,
+                            l3fw_gradients,
+                            l3fb_gradients
+                        );
+                    } else {
+                        let actual = r.read_weights(&ctx).unwrap();
+                        macro_rules! check { ($($f:ident),*) => { $(assert_close_slice(stringify!($f),&actual.$f,&updated.$f,1e-6);)* }; }
+                        check!(l0w, l0b, l1w, l1b, l2w, l2b, l3w, l3b);
+                        macro_rules! optional { ($($f:ident),*) => { $(assert_close_slice(stringify!($f),actual.$f.as_deref().unwrap(),updated.$f.as_deref().unwrap(),1e-6);)* }; }
+                        optional!(l1fw, l1fb, l2fw, l2fb, l3fw, l3fb);
+                    }
+                }
+            }
+        }
+    }
+
     fn tiny_sfnn_shape() -> SfnnForwardShape {
         SfnnForwardShape {
             post_pairwise_transform: PostPairwiseTransform::Identity,
@@ -11363,7 +11531,6 @@ mod tests {
         targets: &[f32],
         entry_weights: &[f32],
     ) -> SfnnCpuBackward {
-        let shape = weights.shape;
         let trace = tiny_sfnn_forward_trace_cpu(batch, weights);
         let mut output_gradients = vec![0.0; batch.batch_size];
         for sample in 0..batch.batch_size {
@@ -11373,6 +11540,16 @@ mod tests {
                 entry_weights[sample] * 2.0 * error * prediction * (1.0 - prediction) / batch.batch_size as f32;
         }
 
+        tiny_sfnn_backward_cpu_with_output_gradients(batch, weights, &output_gradients)
+    }
+
+    fn tiny_sfnn_backward_cpu_with_output_gradients(
+        batch: SfnnForwardHostBatch<'_>,
+        weights: SfnnForwardHostWeights<'_>,
+        output_gradients: &[f32],
+    ) -> SfnnCpuBackward {
+        let shape = weights.shape;
+        let trace = tiny_sfnn_forward_trace_cpu(batch, weights);
         let mut l2_gradients = vec![0.0; batch.batch_size * shape.l2_size];
         let mut l1_gradients = vec![0.0; batch.batch_size * shape.l1_out()];
         let mut l3w_gradients = vec![0.0; shape.num_stacks * shape.l2_size];
