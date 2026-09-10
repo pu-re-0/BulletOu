@@ -56,6 +56,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cuda-cpp-backend")]
+mod issue13_gate0;
+
+#[cfg(feature = "cuda-cpp-backend")]
 use bulletou_lib::value::nnue_save_sfnn1536::{
     FT_HASH_SFNN, KHASH_SFNN, NETWORK_HASH_SFNN, QA as SFNN_QA, QB as SFNN_QB,
 };
@@ -4574,6 +4577,22 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     sfnn_initial_tensor_report: Option<PathBuf>,
 
+    /// Atomically write the exact consumed SFNN minibatch-sequence digest.
+    #[arg(long, value_name = "PATH")]
+    sfnn_batch_digest_report: Option<PathBuf>,
+
+    /// Run the Issue #13 production-shape differential fixture suite.
+    #[arg(long, value_name = "PATH", requires = "issue13_gate0_report")]
+    issue13_gate0_fixtures: Option<PathBuf>,
+
+    /// Atomically publish the Issue #13 Gate 0 report.
+    #[arg(long, value_name = "PATH", requires = "issue13_gate0_fixtures")]
+    issue13_gate0_report: Option<PathBuf>,
+
+    /// Preregistration whose digest is embedded in the Gate 0 report.
+    #[arg(long, value_name = "PATH", requires = "issue13_gate0_fixtures")]
+    issue13_gate0_preregistration: Option<PathBuf>,
+
     /// Analyze how a simple score sigmoid fits the teacher's
     /// `(score, game_result)` statistics. The first `--fit-positions` records
     /// fit the scale; the following `--analyze-positions` records are held out
@@ -5303,6 +5322,19 @@ impl Args {
         }
 
         let eval_type = self.eval_type();
+        let issue13_gate0_fields = [
+            self.issue13_gate0_fixtures.is_some(),
+            self.issue13_gate0_report.is_some(),
+            self.issue13_gate0_preregistration.is_some(),
+        ];
+        if issue13_gate0_fields.iter().any(|&present| present) && !issue13_gate0_fields.iter().all(|&present| present) {
+            return Err("Issue #13 Gate 0 requires fixtures, preregistration, and report paths".to_string());
+        }
+        if self.sfnn_batch_digest_report.is_some()
+            && (!eval_type.uses_layerstack() || self.cuda_cpp_train_steps.is_none())
+        {
+            return Err("--sfnn-batch-digest-report requires CUDA SFNN direct train steps".to_string());
+        }
         if self.sfnn_l0_backward != SfnnL0BackwardSelectorArg::Auto {
             if !eval_type.uses_layerstack() {
                 return Err("--sfnn-l0-backward is supported only by the CUDA SFNN trainer".to_string());
@@ -17056,7 +17088,18 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         Context, RAdamUpdateParams, RangerUpdateParams, SfnnTrainStepHostBatch, SfnnTrainStepRunner,
     };
     use bulletou_lib::value::SfnnTeacherBatchConfig;
+    use sha2::{Digest as _, Sha256};
 
+    if let (Some(fixtures), Some(report), Some(preregistration)) = (
+        args.issue13_gate0_fixtures.as_deref(),
+        args.issue13_gate0_report.as_deref(),
+        args.issue13_gate0_preregistration.as_deref(),
+    ) {
+        if args.arch().cli_name() != "SFNN_halfka2_1024_7_64_k3k3" {
+            return Err("Issue #13 Gate 0 requires SFNN_halfka2_1024_7_64_k3k3".to_string());
+        }
+        return issue13_gate0::run(args.cuda_cpp_device, fixtures, preregistration, report);
+    }
     let schedule = cuda_cpp_run_schedule(args)?;
     let train_steps = schedule.total_steps;
     let batch_size = effective_batch_size(args);
@@ -17514,6 +17557,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     // the YaneuraOu-like quantized score scale.
     let output_inv_scale = effective_output_inv_scale(args);
     let mut seen_steps = 0usize;
+    let mut batch_digest = Sha256::new();
     let mut optimizer_updates = 0usize;
     let mut profile_upload_ms = 0.0_f64;
     let mut profile_forward_ms = 0.0_f64;
@@ -18020,6 +18064,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let checkpoint_chunk = schedule.chunks.get(checkpoint_chunk_idx);
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
+        batch_digest.update((fast.layout.batch_size as u64).to_le_bytes());
+        batch_digest.update((fast.layout.max_active as u64).to_le_bytes());
+        for value in &fast.stm { batch_digest.update(value.to_le_bytes()); }
+        for value in &fast.nstm { batch_digest.update(value.to_le_bytes()); }
+        for value in &fast.buckets { batch_digest.update(value.to_le_bytes()); }
+        for value in &fast.targets { batch_digest.update(value.to_le_bytes()); }
+        for value in &fast.weights { batch_digest.update(value.to_le_bytes()); }
         let params = {
             let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
             let step_index = if is_optimizer_step {
@@ -18599,6 +18650,23 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     }
     let completed_steps = completed_step_offset + seen_steps;
     let optimizer_steps = optimizer_step_offset + optimizer_updates;
+    if let Some(path) = args.sfnn_batch_digest_report.as_deref() {
+        let report = serde_json::json!({
+            "schema_version": "sfnn-batch-sequence-digest-v1",
+            "steps": seen_steps,
+            "batch_size": batch_size,
+            "positions": seen_steps.saturating_mul(batch_size),
+            "sha256": format!("{:x}", batch_digest.finalize()),
+            "dataloader_position": last_dataloader_pos.map(|pos| serde_json::json!({
+                "byte_offset": pos.byte_offset, "plies": pos.plies,
+            })),
+        });
+        let temporary = path.with_extension(format!("{}tmp", path.extension().and_then(|v| v.to_str()).unwrap_or("")));
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("cannot write batch digest report {}: {e}", temporary.display()))?;
+        std::fs::rename(&temporary, path)
+            .map_err(|e| format!("cannot publish batch digest report {}: {e}", path.display()))?;
+    }
     if args.cuda_cpp_skip_final_output {
         if let Some((chunk, _)) = deferred_direct_checkpoint {
             if let Some((metrics, validation_elapsed)) = {

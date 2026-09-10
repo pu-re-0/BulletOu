@@ -1828,6 +1828,17 @@ pub struct SfnnForwardWorkspace {
     pub output: F32Buffer,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SfnnForwardReadback {
+    pub stm_l0: Vec<f32>,
+    pub nstm_l0: Vec<f32>,
+    pub combined: Vec<f32>,
+    pub l1: Vec<f32>,
+    pub l2_input: Vec<f32>,
+    pub l2: Vec<f32>,
+    pub output: Vec<f32>,
+}
+
 impl SfnnForwardWorkspace {
     pub fn new(ctx: &Context, layout: SfnnForwardWorkspaceLayout) -> Result<Self> {
         layout.validate()?;
@@ -1856,6 +1867,18 @@ impl SfnnForwardWorkspace {
 
     pub fn download_output(&self, ctx: &Context) -> Result<Vec<f32>> {
         self.output.download(ctx)
+    }
+
+    pub fn download(&self, ctx: &Context) -> Result<SfnnForwardReadback> {
+        Ok(SfnnForwardReadback {
+            stm_l0: self.stm_l0.download(ctx)?,
+            nstm_l0: self.nstm_l0.download(ctx)?,
+            combined: self.combined.download(ctx)?,
+            l1: self.l1.download(ctx)?,
+            l2_input: self.l2_input.download(ctx)?,
+            l2: self.l2.download(ctx)?,
+            output: self.output.download(ctx)?,
+        })
     }
 }
 
@@ -7655,6 +7678,26 @@ impl SfnnTrainStepRunner {
 
     pub fn read_loss(&self, ctx: &Context) -> Result<ScalarLossReadback> {
         self.loss_workspace.download(ctx)
+    }
+
+    /// Read the most recent training forward intermediates for qualification
+    /// harnesses. This does not launch another forward pass.
+    pub fn read_forward_trace(&self, ctx: &Context) -> Result<SfnnForwardReadback> {
+        self.forward_workspace.download(ctx)
+    }
+
+    /// Read the most recent backward intermediates and every parameter
+    /// gradient. Call this before an optimizer update, because Ranger clears
+    /// gradient buffers after applying them.
+    pub fn read_backward_trace(&self, ctx: &Context) -> Result<SfnnBackwardReadback> {
+        self.backward_workspace.download(ctx)
+    }
+
+    /// Seed the L0 parameter-gradient buffers to verify the replace contract
+    /// of the first backward in a logical optimizer step.
+    pub fn fill_l0_gradient_sentinel(&self, ctx: &Context, l0w: f32, l0b: f32) -> Result<()> {
+        self.backward_workspace.l0w_gradients.fill(ctx, l0w)?;
+        self.backward_workspace.l0b_gradients.fill(ctx, l0b)
     }
 
     pub fn forward_current_weights(
