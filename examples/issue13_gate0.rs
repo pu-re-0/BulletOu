@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
@@ -395,6 +396,26 @@ fn path_name(path: bulletou_cuda_cpp::SfnnL0BackwardPath) -> &'static str {
     }
 }
 
+fn publish_report(report_path: &Path, report: &Value) -> Result<(), String> {
+    let parent = report_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let nonce =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+    let temporary = parent.join(format!(".issue13-report-{}-{nonce}.tmp", std::process::id()));
+    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let bytes = serde_json::to_vec_pretty(report).map_err(|e| e.to_string())?;
+        output.write_all(&bytes).map_err(|e| e.to_string())?;
+        output.sync_all().map_err(|e| e.to_string())?;
+        drop(output);
+        // Same-directory hard link publishes the complete file without replacing
+        // existing evidence, including a concurrent writer's report.
+        fs::hard_link(&temporary, report_path).map_err(|e| e.to_string())
+    })();
+    let cleanup = fs::remove_file(&temporary).map_err(|e| e.to_string());
+    result.and(cleanup)
+}
+
 pub fn run(device: i32, fixture_path: &Path, preregistration_path: &Path, report_path: &Path) -> Result<(), String> {
     let fixture_bytes = fs::read(fixture_path).map_err(|e| format!("cannot read fixtures: {e}"))?;
     let preregistration_bytes =
@@ -525,19 +546,18 @@ pub fn run(device: i32, fixture_path: &Path, preregistration_path: &Path, report
     if da_path != "inverse-index" || dap_path != "materialized-sparse" {
         return Err("IMPLEMENTATION_STOP: resolved Gate 0 kernel path mismatch".to_string());
     }
-    let float_boundary_verified = da_forward.stm_l0[..8].iter().all(|v| v.is_finite())
-        && da_forward.stm_l0[0] == 0.0
-        && da_forward.stm_l0[6] == 1.0
-        && da_forward.stm_l0[7] == 1.0;
-    let integer_export_verified =
-        [0.0_f32, 63.0 / 127.0, 1.0].into_iter().map(|v| (v * 127.0).round() as i32).eq([0, 63, 127]);
-    let fixtures = required.into_iter().map(|name| (name.to_string(), json!({
-        "fixture_sha256": fixture_sha256, "batch_sha256": batch_sha256,
-        "initial_state_sha256": initial_state_sha256, "kernel_paths": {"D-A":da_path,"D-A-prime":dap_path},
-        "sentinel": {"before_nonzero":true,"replacement_verified":sentinel_replaced}, "comparisons": comparisons,
+    // This is one shared synthetic batch. Fixture labels are not independent
+    // executions, and scalar arithmetic is not an exporter differential.
+    let measurement = json!({
+        "fixture_bundle_sha256": fixture_sha256,
+        "batch_sha256": batch_sha256,
+        "initial_weights_sha256": initial_state_sha256,
+        "kernel_paths": {"D-A": da_path, "D-A-prime": dap_path},
+        "sentinel": {"requested_l0w": 17.0, "requested_l0b": -23.0,
+                     "sentinel_values_absent_after_backward": sentinel_replaced},
+        "comparisons": comparisons,
         "worst_tensors": worst_tensors,
-        "boundary_checks": {"float":float_boundary_verified,"integer_export":integer_export_verified},
-    }))).collect::<serde_json::Map<_,_>>();
+    });
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let bulletou_root = current_exe
         .parent()
@@ -572,20 +592,37 @@ pub fn run(device: i32, fixture_path: &Path, preregistration_path: &Path, report
     .map(|v| String::from_utf8_lossy(&v.stdout).trim().replace('\n', " | "))
     .unwrap_or_else(|| "runtime-version-unavailable".to_string());
     let report = json!({
-        "schema_version":"issue13-da-prime-gate0-v1", "producer":"bulletou-issue13-gate0",
+        "schema_version":"issue13-da-prime-diagnostic-v1", "producer":"bulletou-issue13-diagnostic",
+        "acceptance_qualified":false, "preregistration_applied":false,
         "preregistration_sha256":sha256(&preregistration_bytes), "typed_stop":Value::Null,
         "provenance":{"commit":commit,"dirty":dirty,"binary_sha256":binary_sha256,"cuda":cuda,"gpu":bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?,"seed":20260913},
-        "fixtures":fixtures,
+        "shared_batch_measurement":measurement,
+        "unverified":["per-fixture differential", "tensor shapes and per-tensor metrics",
+                      "real-data fixture provenance", "float boundary gradients", "integer/export differential",
+                      "multiple microbatches", "soft-progress", "complete initial train state", "Gate 1 trajectory"],
     });
     if !sentinel_replaced {
         return Err("IMPLEMENTATION_STOP: L0 sentinel was not replaced".to_string());
     }
-    let parent = report_path.parent().ok_or("report has no parent")?;
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let temporary =
-        parent.join(format!(".{}.tmp", report_path.file_name().and_then(|v| v.to_str()).unwrap_or("gate0")));
-    fs::write(&temporary, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    fs::rename(&temporary, report_path).map_err(|e| e.to_string())?;
-    println!("Issue #13 Gate 0 report = {}", report_path.display());
+    publish_report(report_path, &report)?;
+    println!("Issue #13 diagnostic report (not Gate 0 acceptance) = {}", report_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_publish_preserves_existing_evidence_and_cleans_temporary_files() {
+        let root = std::env::temp_dir().join(format!("issue13-publish-test-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("report.json");
+        let first = json!({"measurement": 0.125});
+        publish_report(&path, &first).unwrap();
+        assert!(publish_report(&path, &json!({"measurement": 9.0})).is_err());
+        assert_eq!(serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(), first);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
