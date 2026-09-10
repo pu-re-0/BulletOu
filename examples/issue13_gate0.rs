@@ -553,7 +553,7 @@ pub fn run(device: i32, fixture_path: &Path, preregistration_path: &Path, report
         .filter(|v| v.status.success())
         .map(|v| String::from_utf8_lossy(&v.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let binary_sha256 = sha256(&fs::read(current_exe).map_err(|e| e.to_string())?);
+    let binary_sha256 = sha256(&fs::read(&current_exe).map_err(|e| e.to_string())?);
     let dirty = Command::new("git")
         .current_dir(bulletou_root)
         .args(["status", "--porcelain"])
@@ -562,9 +562,15 @@ pub fn run(device: i32, fixture_path: &Path, preregistration_path: &Path, report
         .filter(|v| v.status.success())
         .map(|v| !v.stdout.is_empty())
         .unwrap_or(true);
-    let cuda = Command::new(option_env!("CUDA_PATH").map(|root| format!("{root}/bin/nvcc")).unwrap_or_else(|| "nvcc".to_string()))
-        .arg("--version").output().ok().filter(|v| v.status.success())
-        .map(|v| String::from_utf8_lossy(&v.stdout).trim().replace('\n', " | ")).unwrap_or_else(|| "runtime-version-unavailable".to_string());
+    let cuda = Command::new(
+        option_env!("CUDA_PATH").map(|root| format!("{root}/bin/nvcc")).unwrap_or_else(|| "nvcc".to_string()),
+    )
+    .arg("--version")
+    .output()
+    .ok()
+    .filter(|v| v.status.success())
+    .map(|v| String::from_utf8_lossy(&v.stdout).trim().replace('\n', " | "))
+    .unwrap_or_else(|| "runtime-version-unavailable".to_string());
     let report = json!({
         "schema_version":"issue13-da-prime-gate0-v1", "producer":"bulletou-issue13-gate0",
         "preregistration_sha256":sha256(&preregistration_bytes), "typed_stop":Value::Null,
