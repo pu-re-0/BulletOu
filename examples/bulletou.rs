@@ -71,15 +71,33 @@ const NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE: u32 = 0xC199BC6A;
 
 #[cfg(feature = "cuda-cpp-backend")]
 const KHASH_SFNN_BAND2_BLOCK_PERMUTE: u32 = 0x9E8AF6D2;
+#[cfg(feature = "cuda-cpp-backend")]
+const NETWORK_HASH_SFNN_PAIRWISE_SCALE_HALF: u32 = 0x3AEB662E;
+#[cfg(feature = "cuda-cpp-backend")]
+const KHASH_SFNN_PAIRWISE_SCALE_HALF: u32 = 0x65F82C96;
+#[cfg(feature = "cuda-cpp-backend")]
+const NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF: u32 = 0xE5917CCB;
+#[cfg(feature = "cuda-cpp-backend")]
+const KHASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF: u32 = 0xBA823673;
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_network_hash(arch: NnueArch) -> u32 {
-    if arch.band2_block_permute { NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE } else { NETWORK_HASH_SFNN }
+    match arch.post_pairwise_transform {
+        PostPairwiseTransform::Identity => NETWORK_HASH_SFNN,
+        PostPairwiseTransform::ScaleHalf => NETWORK_HASH_SFNN_PAIRWISE_SCALE_HALF,
+        PostPairwiseTransform::Band2RotateHalf => NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE,
+        PostPairwiseTransform::Band2RotateFull => NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF,
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_model_hash(arch: NnueArch, wants_progress: bool) -> u32 {
-    let base = if arch.band2_block_permute { KHASH_SFNN_BAND2_BLOCK_PERMUTE } else { KHASH_SFNN };
+    let base = match arch.post_pairwise_transform {
+        PostPairwiseTransform::Identity => KHASH_SFNN,
+        PostPairwiseTransform::ScaleHalf => KHASH_SFNN_PAIRWISE_SCALE_HALF,
+        PostPairwiseTransform::Band2RotateHalf => KHASH_SFNN_BAND2_BLOCK_PERMUTE,
+        PostPairwiseTransform::Band2RotateFull => KHASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF,
+    };
     if wants_progress { base ^ SHOGI_SFNN_PROGRESS_HASH } else { base }
 }
 use bulletou_lib::{
@@ -673,7 +691,38 @@ struct NnueArch {
     sfnn_l1_group_count: Option<usize>,
     sfnn_l1_common_size: Option<usize>,
     sfnn_l1_shard_size: Option<usize>,
-    band2_block_permute: bool,
+    post_pairwise_transform: PostPairwiseTransform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostPairwiseTransform {
+    Identity,
+    ScaleHalf,
+    Band2RotateHalf,
+    Band2RotateFull,
+}
+
+impl PostPairwiseTransform {
+    fn marker(self) -> f32 { match self { Self::Identity => 0.0, Self::ScaleHalf => 1.0, Self::Band2RotateHalf => 2.0, Self::Band2RotateFull => 3.0 } }
+    fn cli_suffix(self) -> &'static str { match self {
+        Self::Identity => "", Self::ScaleHalf => "_pairwise_scale_half",
+        Self::Band2RotateHalf => "_band2_block_permute",
+        Self::Band2RotateFull => "_band2_block_permute_no_half",
+    }}
+    #[cfg(feature = "cuda-cpp-backend")]
+    fn cuda(self) -> bulletou_cuda_cpp::PostPairwiseTransform { match self {
+        Self::Identity => bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+        Self::ScaleHalf => bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf,
+        Self::Band2RotateHalf => bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf,
+        Self::Band2RotateFull => bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull,
+    }}
+    #[cfg(feature = "cuda-cpp-backend")]
+    fn from_cuda(value: bulletou_cuda_cpp::PostPairwiseTransform) -> Self { match value {
+        bulletou_cuda_cpp::PostPairwiseTransform::Identity => Self::Identity,
+        bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf => Self::ScaleHalf,
+        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf => Self::Band2RotateHalf,
+        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull => Self::Band2RotateFull,
+    }}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,7 +762,7 @@ impl NnueArch {
             sfnn_l1_group_count: None,
             sfnn_l1_common_size: None,
             sfnn_l1_shard_size: None,
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
         }
     }
 
@@ -749,11 +798,6 @@ impl NnueArch {
         self.has_common_shard_sfnn_l1()
     }
 
-    fn with_band2_block_permute(mut self) -> Self {
-        self.band2_block_permute = true;
-        self
-    }
-
     fn sfnn_l1_skip(self) -> bool {
         self.family == NnueArchFamily::Sfnn && self.l2 % 8 == 7
     }
@@ -782,18 +826,18 @@ impl NnueArch {
                         self.sfnn_l1_group_count()
                     );
                     if layerstack == LayerStackMode::Single {
-                        if self.band2_block_permute { format!("{base}_band2_block_permute") } else { base }
+                        format!("{base}{}", self.post_pairwise_transform.cli_suffix())
                     } else {
                         let base = format!("{base}_{}", layerstack.arch_suffix());
-                        if self.band2_block_permute { format!("{base}_band2_block_permute") } else { base }
+                        format!("{base}{}", self.post_pairwise_transform.cli_suffix())
                     }
                 } else {
                     let base = format!("SFNN_{}_{}_{}_{}", self.feature.arch_suffix(), self.l1, self.l2, self.l3);
                     if layerstack == LayerStackMode::Single {
-                        if self.band2_block_permute { format!("{base}_band2_block_permute") } else { base }
+                        format!("{base}{}", self.post_pairwise_transform.cli_suffix())
                     } else {
                         let base = format!("{base}_{}", layerstack.arch_suffix());
-                        if self.band2_block_permute { format!("{base}_band2_block_permute") } else { base }
+                        format!("{base}{}", self.post_pairwise_transform.cli_suffix())
                     }
                 }
             }
@@ -1046,10 +1090,16 @@ impl std::str::FromStr for NnueArch {
                     ));
                 }
                 let mut layerstack_end = tokens.len();
-                let has_band2 = tokens.get(tokens.len().saturating_sub(3)..) == Some(&["band2", "block", "permute"]);
-                if has_band2 {
+                let transform = if tokens.get(tokens.len().saturating_sub(5)..) == Some(&["band2", "block", "permute", "no", "half"][..]) {
+                    layerstack_end -= 5;
+                    PostPairwiseTransform::Band2RotateFull
+                } else if tokens.get(tokens.len().saturating_sub(3)..) == Some(&["band2", "block", "permute"][..]) {
                     layerstack_end -= 3;
-                }
+                    PostPairwiseTransform::Band2RotateHalf
+                } else if tokens.get(tokens.len().saturating_sub(3)..) == Some(&["pairwise", "scale", "half"][..]) {
+                    layerstack_end -= 3;
+                    PostPairwiseTransform::ScaleHalf
+                } else { PostPairwiseTransform::Identity };
                 let layerstack_spec = tokens[layerstack_start..layerstack_end].join("_");
                 let layerstack = parse_sfnn_layerstack_spec(&layerstack_spec, s)?;
                 let arch = NnueArch::new(family, feature, l1, l2, l3, Some(layerstack));
@@ -1058,8 +1108,8 @@ impl std::str::FromStr for NnueArch {
                 } else {
                     arch
                 };
-                let arch = if has_band2 { arch.with_band2_block_permute() } else { arch };
-                if arch.band2_block_permute
+                let arch = NnueArch { post_pairwise_transform: transform, ..arch };
+                if arch.post_pairwise_transform != PostPairwiseTransform::Identity
                     && !(arch.feature == NnueArchFeature::Halfka2
                         && arch.l1 == 1024
                         && arch.l2 == 7
@@ -1067,7 +1117,7 @@ impl std::str::FromStr for NnueArch {
                         && arch.layerstack == Some(LayerStackMode::Kingrank3by3))
                 {
                     return Err(format!(
-                        "invalid arch `{s}`: band2_block_permute is fixed to SFNN_halfka2_1024_7_64_k3k3"
+                        "invalid arch `{s}`: post-pairwise transforms are fixed to SFNN_halfka2_1024_7_64_k3k3"
                     ));
                 }
                 arch.validate_dims(s)
@@ -4468,6 +4518,11 @@ struct Args {
     #[arg(long)]
     count_teacher: bool,
 
+    /// Write SHA-256 for every scratch-initialised SFNN tensor and exit.
+    /// This is read-only with respect to checkpoints and training outputs.
+    #[arg(long, value_name = "PATH")]
+    sfnn_initial_tensor_report: Option<PathBuf>,
+
     /// Analyze how a simple score sigmoid fits the teacher's
     /// `(score, game_result)` statistics. The first `--fit-positions` records
     /// fit the scale; the following `--analyze-positions` records are held out
@@ -5127,7 +5182,11 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
-        if self.count_teacher || self.analyze_score_winrate || self.cuda_cpp_smoke {
+        if self.count_teacher
+            || self.analyze_score_winrate
+            || self.cuda_cpp_smoke
+            || self.sfnn_initial_tensor_report.is_some()
+        {
             return Ok(());
         }
 
@@ -6287,7 +6346,8 @@ fn collect_sfnn_l3b_offsets(bytes: &[u8], arch: NnueArch, layerstack: LayerStack
         let mut pos = network_base + stack * stack_bytes;
         let hash = read_u32_le(bytes, pos, "SFNN network hash")?;
         let expected_network_hash = sfnn_network_hash(arch);
-        let accepts_legacy = !arch.band2_block_permute && hash == NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS;
+        let accepts_legacy = arch.post_pairwise_transform == PostPairwiseTransform::Identity
+            && hash == NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS;
         if hash != expected_network_hash && !accepts_legacy {
             return Err(format!(
                 "SFNN stack {stack} network hash mismatch for --arch {arch}: expected 0x{expected_network_hash:08X}, got 0x{hash:08X}"
@@ -6388,7 +6448,7 @@ fn run_nerf(args: &NerfArgs) -> Result<NerfReport, String> {
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug)]
 struct QuantizedSfnnWeights {
-    band2_block_permute: bool,
+    post_pairwise_transform: PostPairwiseTransform,
     arch_desc: String,
     feature_kind: CudaCppSfnnFeatureKind,
     layerstack: LayerStackMode,
@@ -7113,7 +7173,8 @@ fn parse_quantized_sfnn_nn_bin(
     for stack in 0..num_stacks {
         let hash = read_u32_le(&bytes, pos, "SFNN network hash")?;
         let expected_network_hash = sfnn_network_hash(arch);
-        let accepts_legacy = !arch.band2_block_permute && hash == NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS;
+        let accepts_legacy = arch.post_pairwise_transform == PostPairwiseTransform::Identity
+            && hash == NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS;
         if hash != expected_network_hash && !accepts_legacy {
             return Err(format!(
                 "{}: SFNN stack {stack} network hash mismatch for --arch {}: expected 0x{expected_network_hash:08X}, got 0x{hash:08X}",
@@ -7153,7 +7214,7 @@ fn parse_quantized_sfnn_nn_bin(
     }
 
     Ok(QuantizedSfnnWeights {
-        band2_block_permute: arch.band2_block_permute,
+        post_pairwise_transform: arch.post_pairwise_transform,
         arch_desc,
         feature_kind,
         layerstack,
@@ -7323,7 +7384,7 @@ fn quantized_sfnn_forward_sample(
         state.ft[pairwise + j] = quantized_sfnn_ft_pair_value(nstm0, nstm1, ft_shift, ft_round);
     }
 
-    if weights.band2_block_permute {
+    if weights.post_pairwise_transform != PostPairwiseTransform::Identity {
         for perspective in 0..2 {
             let base = perspective * pairwise;
             for block in (0..pairwise).step_by(4) {
@@ -7333,7 +7394,22 @@ fn quantized_sfnn_forward_sample(
                     state.ft[base + block + 2],
                     state.ft[base + block + 3],
                 ];
-                state.ft[base + block..base + block + 4].copy_from_slice(&quantized_band2_block(original));
+                let transformed = match weights.post_pairwise_transform {
+                    PostPairwiseTransform::Identity => original,
+                    PostPairwiseTransform::ScaleHalf => original.map(|value| value / 2),
+                    PostPairwiseTransform::Band2RotateHalf => quantized_band2_block(original),
+                    PostPairwiseTransform::Band2RotateFull => {
+                        let mut output = [0u8; 4];
+                        for index in 0..4 {
+                            let low = original[index].min(63);
+                            let next = original[(index + 1) % 4];
+                            let high = next.saturating_sub(63).min(63);
+                            output[index] = (u16::from(low) + u16::from(high)) as u8;
+                        }
+                        output
+                    }
+                };
+                state.ft[base + block..base + block + 4].copy_from_slice(&transformed);
             }
         }
     }
@@ -8932,7 +9008,7 @@ fn cuda_cpp_sfnn_quantized_proxy_shape(
 ) -> bulletou_cuda_cpp::SfnnForwardShape {
     if cuda_cpp_sfnn_quantized_proxy_retains_factorizer(args, shape) {
         return bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: shape.band2_block_permute,
+        post_pairwise_transform: shape.post_pairwise_transform,
             input_size: feature_kind.base_input_size(),
             ft_size: shape.ft_size,
             l1_hidden: shape.l1_hidden,
@@ -8951,7 +9027,7 @@ fn cuda_cpp_sfnn_quantized_proxy_shape(
         };
     }
     bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: shape.band2_block_permute,
+        post_pairwise_transform: shape.post_pairwise_transform,
         input_size: feature_kind.base_input_size(),
         ft_size: shape.ft_size,
         l1_hidden: shape.l1_hidden,
@@ -9129,7 +9205,7 @@ fn cuda_cpp_sfnn_initial_weights_factorizer_active(
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_dequantize_proxy_weights(weights: &QuantizedSfnnWeights) -> Result<CudaCppSfnnInitialWeights, String> {
     let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: weights.band2_block_permute,
+        post_pairwise_transform: weights.post_pairwise_transform.cuda(),
         input_size: weights.input_size,
         ft_size: weights.ft_size,
         l1_hidden: weights.l1_hidden,
@@ -9453,7 +9529,7 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
     }
 
     Ok(QuantizedSfnnWeights {
-        band2_block_permute: shape.band2_block_permute,
+        post_pairwise_transform: PostPairwiseTransform::from_cuda(shape.post_pairwise_transform),
         arch_desc: format!(
             "ModelType=SFNNWithoutPsqt;Features={}[{}->{}x2],Network=SFNN-{}{{LayerStack={}}}",
             feature_set.display_name(),
@@ -10563,7 +10639,7 @@ impl WorkerSfnnSession {
             write_cuda_cpp_sfnn_weights_bin(
                 &tmp_dir.join("state.bin"),
                 &weights,
-                self.shape.band2_block_permute,
+                self.shape.post_pairwise_transform,
                 &optimizer_states,
                 self.progress_state.as_ref(),
                 completed_steps,
@@ -11364,7 +11440,7 @@ impl WorkerSfnnSession {
                 write_cuda_cpp_sfnn_weights_bin(
                     &tmp_dir.join("state.bin"),
                     &weights,
-                    self.shape.band2_block_permute,
+                    self.shape.post_pairwise_transform,
                     &optimizer_states,
                     self.progress_state.as_ref(),
                     self.completed_steps,
@@ -12138,6 +12214,22 @@ fn main() {
         std::process::exit(2);
     });
     let args = Args::parse_from(raw_args);
+    if let Some(path) = args.sfnn_initial_tensor_report.as_deref() {
+        #[cfg(feature = "cuda-cpp-backend")]
+        match write_sfnn_initial_tensor_report(&args, path) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("error: --sfnn-initial-tensor-report failed: {e}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            let _ = path;
+            eprintln!("error: --sfnn-initial-tensor-report requires --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+    }
     // `--count-teacher` operates standalone (no training): print position
     // counts for the supplied teacher path(s) and exit.
     if args.count_teacher {
@@ -19206,7 +19298,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
         write_cuda_cpp_sfnn_weights_bin(
             &tmp_dir.join("state.bin"),
             weights,
-            shape.band2_block_permute,
+            shape.post_pairwise_transform,
             optimizer_states,
             progress_state,
             completed_steps,
@@ -20855,7 +20947,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let l2_init_scale = effective_sfnn_init_l2_scale(args);
     let l3_init_scale = effective_sfnn_init_l3_scale(args);
     let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: args.arch().band2_block_permute,
+        post_pairwise_transform: args.arch().post_pairwise_transform.cuda(),
         input_size,
         ft_size,
         l1_hidden,
@@ -20968,6 +21060,101 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn write_sfnn_initial_tensor_report(args: &Args, path: &Path) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+
+    if args.arch().family != NnueArchFamily::Sfnn
+        || args.arch().feature != NnueArchFeature::Halfka2
+        || args.arch().dims() != (1024, 7, 64)
+        || args.effective_layerstack() != Some(LayerStackMode::Kingrank3by3)
+    {
+        return Err("--sfnn-initial-tensor-report is fixed to SFNN_halfka2_1024_7_64_k3k3 transform variants"
+            .to_string());
+    }
+    if !effective_sfnn_factorized_l1(args)
+        || !effective_sfnn_factorized_l2_l3(args)
+        || effective_sfnn_axis_factorized_l1(args)
+        || effective_sfnn_axis_factorized_l2_l3(args)
+    {
+        return Err("--sfnn-initial-tensor-report requires --sfnn-factorizer shared".to_string());
+    }
+    let weights = build_sfnn_initial_weights_for_cuda_cpp(args, CudaCppSfnnFeatureKind::Halfka2)?;
+    let mut tensors = serde_json::Map::new();
+    let mut record = |name: &str, values: &[f32]| {
+        let mut hasher = Sha256::new();
+        for value in values {
+            hasher.update(value.to_le_bytes());
+        }
+        tensors.insert(name.to_string(), serde_json::json!({
+            "element_count": values.len(),
+            "byte_count": values.len() * std::mem::size_of::<f32>(),
+            "sha256": format!("{:x}", hasher.finalize()),
+        }));
+    };
+    record("l0w", &weights.l0w);
+    record("l0b", &weights.l0b);
+    record("l1w", &weights.l1w);
+    record("l1b", &weights.l1b);
+    record("l2w", &weights.l2w);
+    record("l2b", &weights.l2b);
+    record("l3w", &weights.l3w);
+    record("l3b", &weights.l3b);
+    for (name, values) in [
+        ("l1fw", weights.l1fw.as_deref()),
+        ("l1fb", weights.l1fb.as_deref()),
+        ("l1axw", weights.l1axw.as_deref()),
+        ("l1axb", weights.l1axb.as_deref()),
+        ("l2fw", weights.l2fw.as_deref()),
+        ("l2fb", weights.l2fb.as_deref()),
+        ("l2axw", weights.l2axw.as_deref()),
+        ("l2axb", weights.l2axb.as_deref()),
+        ("l3fw", weights.l3fw.as_deref()),
+        ("l3fb", weights.l3fb.as_deref()),
+        ("l3axw", weights.l3axw.as_deref()),
+        ("l3axb", weights.l3axb.as_deref()),
+    ] {
+        if let Some(values) = values {
+            record(name, values);
+        }
+    }
+    let executable = std::env::current_exe().map_err(|e| format!("cannot resolve current executable: {e}"))?;
+    let executable_bytes = std::fs::read(&executable)
+        .map_err(|e| format!("cannot read current executable {}: {e}", executable.display()))?;
+    let report = serde_json::json!({
+        "schema_version": "sfnn-initial-tensor-report-v1",
+        "architecture": args.arch().cli_name(),
+        "post_pairwise_transform": args.arch().post_pairwise_transform.marker() as i32,
+        "byte_encoding": "f32-little-endian",
+        "producer_identity": {
+            "binary_path": executable,
+            "binary_size_bytes": executable_bytes.len(),
+            "binary_sha256": format!("{:x}", Sha256::digest(&executable_bytes)),
+        },
+        "initialization_config": {
+            "architecture": args.arch().cli_name(),
+            "sfnn_factorizer": "shared",
+            "nnue_pytorch_init_scale": args.nnue_pytorch_init_scale,
+            "sfnn_init_bias": args.sfnn_init_bias.cli_name(),
+            "sfnn_init_l2_scale": effective_sfnn_init_l2_scale(args),
+            "sfnn_init_l3_scale": effective_sfnn_init_l3_scale(args),
+            "initialization_seeds": {
+                "l0w": "0x5f11e001", "l0b": "0x5f11e002",
+                "l1w": "0x5f11e003", "l1b": "0x5f11e004",
+                "l2w": "0x5f11e005", "l2b": "0x5f11e006",
+                "l3w": "0x5f11e007", "l3b": "constant-zero",
+                "factorizer_tensors": "constant-zero",
+            },
+        },
+        "tensors": tensors,
+    });
+    let temporary = path.with_extension(format!("{}tmp", path.extension().and_then(|v| v.to_str()).unwrap_or("")));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("cannot write {}: {e}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|e| format!("cannot publish {}: {e}", path.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn load_cuda_cpp_sfnn_initial_state(
     path: &Path,
     args: &Args,
@@ -20977,16 +21164,16 @@ fn load_cuda_cpp_sfnn_initial_state(
         load_cuda_cpp_component_state_sections(path, "nnue", &["weights", "train", "step_ranger"], true)?;
     let mut weights_records = initial_sections.remove("weights").unwrap_or_default();
 
-    let requested_band2 = args.arch().band2_block_permute;
+    let requested_transform = args.arch().post_pairwise_transform;
     match weights_records.remove("band2_block_permute") {
-        Some(marker) if marker.as_slice() == [if requested_band2 { 2.0 } else { 0.0 }] => {}
+        Some(marker) if marker.as_slice() == [requested_transform.marker()] => {}
         Some(marker) => {
             return Err(format!(
                 "SFNN state {} band2_block_permute marker {:?} does not match --arch {}",
                 path.display(), marker, args.arch().cli_name()
             ));
         }
-        None if requested_band2 => {
+        None if requested_transform != PostPairwiseTransform::Identity => {
             return Err(format!(
                 "SFNN state {} has no band2_block_permute marker required by --arch {}",
                 path.display(), args.arch().cli_name()
@@ -20998,7 +21185,7 @@ fn load_cuda_cpp_sfnn_initial_state(
     let (ft_size, l1_hidden, l2_size) = args.arch().dims();
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: args.arch().band2_block_permute,
+        post_pairwise_transform: args.arch().post_pairwise_transform.cuda(),
         input_size: feature_kind.training_input_size(),
         ft_size,
         l1_hidden,
@@ -23273,7 +23460,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
     write_cuda_cpp_sfnn_weights_bin(
         &dir.join("weights.bin"),
         weights,
-        shape.band2_block_permute,
+        shape.post_pairwise_transform,
         optimizer_states,
         progress_state,
         completed_steps,
@@ -23285,7 +23472,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
 fn write_cuda_cpp_sfnn_weights_bin(
     path: &Path,
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
-    band2_block_permute: bool,
+    post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform,
     optimizer_states: &bulletou_cuda_cpp::SfnnRangerOptimizerStatesReadback,
     progress_state: Option<&CudaCppSfnnProgressTrainState>,
     completed_steps: usize,
@@ -23293,7 +23480,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
 ) -> Result<(), String> {
     let completed_steps_record = [completed_steps as f32];
     let optimizer_steps_record = [optimizer_steps as f32];
-    let band2_block_permute_record = [if band2_block_permute { 2.0 } else { 0.0 }];
+    let band2_block_permute_record = [post_pairwise_transform.as_i32() as f32];
     let mut records: Vec<(&str, &[f32])> = vec![
         ("nnue/train/completed_steps", completed_steps_record.as_slice()),
         ("nnue/weights/band2_block_permute", band2_block_permute_record.as_slice()),
@@ -23523,7 +23710,12 @@ fn write_cuda_cpp_sfnn_nn_bin(
 
     let file = std::fs::File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?;
     let mut writer = std::io::BufWriter::new(file);
-    let band_modifier = if shape.band2_block_permute { ";Band2BlockPermute=K2P63of128RotateLeft1Block4" } else { "" };
+    let (band_modifier, export_network_hash, mut sfnn_hash) = match shape.post_pairwise_transform {
+        bulletou_cuda_cpp::PostPairwiseTransform::Identity => ("", NETWORK_HASH_SFNN, KHASH_SFNN),
+        bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf => (";PairwiseScaleHalf=P63of128", NETWORK_HASH_SFNN_PAIRWISE_SCALE_HALF, KHASH_SFNN_PAIRWISE_SCALE_HALF),
+        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf => (";Band2BlockPermute=K2P63of128RotateLeft1Block4", NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE, KHASH_SFNN_BAND2_BLOCK_PERMUTE),
+        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull => (";Band2BlockPermuteNoHalf=K2P63of128RotateLeft1Block4", NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF, KHASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF),
+    };
     let arch = format!(
         "ModelType=SFNNWithoutPsqt;Features={}[{}->{}x2],Network=SFNN-{}{{LayerStack={}{}}}",
         feature_set.display_name(),
@@ -23533,12 +23725,6 @@ fn write_cuda_cpp_sfnn_nn_bin(
         shape.num_stacks,
         band_modifier
     );
-    let export_network_hash = if shape.band2_block_permute {
-        NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE
-    } else {
-        NETWORK_HASH_SFNN
-    };
-    let mut sfnn_hash = if shape.band2_block_permute { KHASH_SFNN_BAND2_BLOCK_PERMUTE } else { KHASH_SFNN };
     if progress_params.is_some() {
         sfnn_hash ^= SHOGI_SFNN_PROGRESS_HASH;
     }
@@ -26665,12 +26851,29 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn parses_fixed_band2_architecture_and_keeps_canonical_name() {
-        let raw = "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute";
-        let arch = NnueArch::from_str(raw).unwrap();
-        assert!(arch.band2_block_permute);
-        assert_eq!(arch.cli_name(), raw);
+    fn parses_fixed_post_pairwise_architectures_and_keeps_canonical_names() {
+        for (raw, expected) in [
+            ("SFNN_halfka2_1024_7_64_k3k3", PostPairwiseTransform::Identity),
+            (
+                "SFNN_halfka2_1024_7_64_k3k3_pairwise_scale_half",
+                PostPairwiseTransform::ScaleHalf,
+            ),
+            (
+                "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute",
+                PostPairwiseTransform::Band2RotateHalf,
+            ),
+            (
+                "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute_no_half",
+                PostPairwiseTransform::Band2RotateFull,
+            ),
+        ] {
+            let arch = NnueArch::from_str(raw).unwrap();
+            assert_eq!(arch.post_pairwise_transform, expected);
+            assert_eq!(arch.cli_name(), raw);
+        }
         assert!(NnueArch::from_str("SFNN_halfka2_2048_7_64_k3k3_band2_block_permute").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_2048_7_64_k3k3_pairwise_scale_half").is_err());
+        assert!(NnueArch::from_str("SFNN_halfka2_2048_7_64_k3k3_band2_block_permute_no_half").is_err());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -28379,7 +28582,7 @@ mod tests {
         ])
         .unwrap();
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 133_578,
             ft_size: 1024,
             l1_hidden: 8,
@@ -29358,7 +29561,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_factorizer_axis_ids_ignore_progress_axis() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -29395,7 +29598,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_factorizer_axis_ids_include_pair_axes() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -29435,7 +29638,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_residual_count_gate_rebase_preserves_effective_multiplier() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -29475,7 +29678,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_residual_count_gate_rebase_handles_newly_enabled_gate() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -30619,7 +30822,7 @@ mod tests {
             .unwrap();
 
             let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
                 input_size: CudaCppSfnnFeatureKind::Halfka2.training_input_size(),
                 ft_size,
                 l1_hidden,
@@ -30695,7 +30898,7 @@ mod tests {
             args.validate_backend_flags().unwrap();
 
             let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
                 input_size: feature_kind.training_input_size(),
                 ft_size,
                 l1_hidden: 7,
@@ -30731,7 +30934,7 @@ mod tests {
     fn cuda_cpp_sfnn_common_shard_export_allows_inactive_l1_factorizer() {
         let feature_kind = CudaCppSfnnFeatureKind::Halfka2;
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: feature_kind.training_input_size(),
             ft_size: 4,
             l1_hidden: 1,
@@ -30838,7 +31041,7 @@ mod tests {
             args.validate_backend_flags().unwrap();
 
             let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
                 input_size: CudaCppSfnnFeatureKind::Ka2.training_input_size(),
                 ft_size,
                 l1_hidden: l1_out - 1,
@@ -31045,7 +31248,16 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
 
-        write_cuda_cpp_sfnn_weights_bin(&path, &weights, false, &optimizer, None, 1234, 11).unwrap();
+        write_cuda_cpp_sfnn_weights_bin(
+            &path,
+            &weights,
+            bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            &optimizer,
+            None,
+            1234,
+            11,
+        )
+        .unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let records = parse_model_weights_bin(&bytes).unwrap();
@@ -31098,7 +31310,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_loads_ranger_optimizer_state_records() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31279,7 +31491,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l1f_fold_adds_shared_l1_to_each_stack() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 3,
             l1_hidden: 1,
@@ -31327,7 +31539,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l1f_fold_applies_shared_alpha() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 2,
             ft_size: 2,
             l1_hidden: 1,
@@ -31359,7 +31571,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l2_l3_fold_adds_shared_terms_to_each_stack() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 3,
             l1_hidden: 2,
@@ -31417,7 +31629,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l3_axis_fold_adds_selected_king_axes() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31467,7 +31679,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l3_axis_fold_applies_axis_alpha() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31530,7 +31742,7 @@ mod tests {
         }
 
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31672,7 +31884,7 @@ mod tests {
         }
 
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31780,7 +31992,7 @@ mod tests {
         }
 
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        band2_block_permute: false,
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -34107,17 +34319,34 @@ mod tests {
     }
 
     #[test]
-    fn band2_and_baseline_network_hashes_fail_closed() {
+    fn all_post_pairwise_hashes_follow_xor_contract_and_fail_closed() {
         let baseline =
             NnueArch::new(NnueArchFamily::Sfnn, NnueArchFeature::Halfka2, 1024, 7, 64, Some(LayerStackMode::Kingrank3by3));
-        let band2 = baseline.with_band2_block_permute();
-        let baseline_bytes = fake_sfnn_nn_bin(baseline, LayerStackMode::Kingrank3by3.num_stacks());
-        let band2_bytes = fake_sfnn_nn_bin(band2, LayerStackMode::Kingrank3by3.num_stacks());
+        let arches: Vec<_> = [
+            PostPairwiseTransform::Identity,
+            PostPairwiseTransform::ScaleHalf,
+            PostPairwiseTransform::Band2RotateHalf,
+            PostPairwiseTransform::Band2RotateFull,
+        ]
+        .into_iter()
+        .map(|post_pairwise_transform| NnueArch { post_pairwise_transform, ..baseline })
+        .collect();
+        let models: Vec<_> = arches
+            .iter()
+            .map(|&arch| fake_sfnn_nn_bin(arch, LayerStackMode::Kingrank3by3.num_stacks()))
+            .collect();
 
-        collect_sfnn_l3b_offsets(&baseline_bytes, baseline, LayerStackMode::Kingrank3by3).unwrap();
-        collect_sfnn_l3b_offsets(&band2_bytes, band2, LayerStackMode::Kingrank3by3).unwrap();
-        assert!(collect_sfnn_l3b_offsets(&baseline_bytes, band2, LayerStackMode::Kingrank3by3).is_err());
-        assert!(collect_sfnn_l3b_offsets(&band2_bytes, baseline, LayerStackMode::Kingrank3by3).is_err());
+        for (model_index, model) in models.iter().enumerate() {
+            for (engine_index, &arch) in arches.iter().enumerate() {
+                let accepted = collect_sfnn_l3b_offsets(model, arch, LayerStackMode::Kingrank3by3).is_ok();
+                assert_eq!(accepted, model_index == engine_index, "model {model_index} engine {engine_index}");
+            }
+        }
+        for arch in arches {
+            let base = FT_HASH_SFNN ^ sfnn_network_hash(arch);
+            assert_eq!(sfnn_model_hash(arch, false), base);
+            assert_eq!(sfnn_model_hash(arch, true), base ^ SHOGI_SFNN_PROGRESS_HASH);
+        }
     }
 
     #[test]

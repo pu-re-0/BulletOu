@@ -315,6 +315,7 @@ fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static>
 
 fn tiny_sfnn_shape() -> SfnnForwardShape {
     SfnnForwardShape {
+        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
         input_size: 4,
         ft_size: 4,
         l1_hidden: 2,

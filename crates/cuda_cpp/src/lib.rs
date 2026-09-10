@@ -865,8 +865,7 @@ pub fn nnue_forward_device(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SfnnForwardShape {
-    /// Apply Issue #11's fixed post-pairwise two-band transform before fc0.
-    pub band2_block_permute: bool,
+    pub post_pairwise_transform: PostPairwiseTransform,
     pub input_size: usize,
     pub ft_size: usize,
     pub l1_hidden: usize,
@@ -908,6 +907,19 @@ pub struct SfnnForwardShape {
     pub factorizer_king_progress_pair: bool,
     /// Add one factorizer component for each hand-bucket x progress-bucket pair.
     pub factorizer_hand_progress_pair: bool,
+}
+
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostPairwiseTransform {
+    Identity = 0,
+    ScaleHalf = 1,
+    Band2RotateHalf = 2,
+    Band2RotateFull = 3,
+}
+
+impl PostPairwiseTransform {
+    pub fn as_i32(self) -> i32 { self as i32 }
 }
 
 impl SfnnForwardShape {
@@ -2011,7 +2023,7 @@ fn sfnn_forward_device_with_factorizer_impl(
             shape.ft_size,
             shape.l1_hidden,
             i32::from(shape.l1_skip),
-            i32::from(shape.band2_block_permute),
+            shape.post_pairwise_transform.as_i32(),
             shape.l2_size,
             shape.num_stacks,
             shape.l1_group_count,
@@ -2211,7 +2223,7 @@ pub fn sfnn_build_quantized_proxy_device(
             shape.ft_size,
             shape.l1_hidden,
             i32::from(shape.l1_skip),
-            i32::from(shape.band2_block_permute),
+            shape.post_pairwise_transform.as_i32(),
             shape.l2_size,
             shape.num_stacks,
             shape.l1_group_count,
@@ -3596,7 +3608,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
             shape.ft_size,
             shape.l1_hidden,
             i32::from(shape.l1_skip),
-            i32::from(shape.band2_block_permute),
+            shape.post_pairwise_transform.as_i32(),
             shape.l2_size,
             shape.num_stacks,
             shape.l1_group_count,
@@ -3801,7 +3813,7 @@ fn sfnn_backward_device_impl(
                 shape.ft_size,
                 shape.l1_hidden,
                 i32::from(shape.l1_skip),
-                i32::from(shape.band2_block_permute),
+                shape.post_pairwise_transform.as_i32(),
                 shape.l2_size,
                 shape.num_stacks,
                 shape.l1_group_count,
@@ -3886,7 +3898,7 @@ fn sfnn_backward_device_impl(
                 shape.ft_size,
                 shape.l1_hidden,
                 i32::from(shape.l1_skip),
-                i32::from(shape.band2_block_permute),
+                shape.post_pairwise_transform.as_i32(),
                 shape.l2_size,
                 shape.num_stacks,
                 shape.l1_group_count,
@@ -8383,7 +8395,7 @@ fn sfnn_add_saturation_penalty_gradients_device(
         _ => return Err(CudaCppError::message("SFNN saturation shared weight/gradient optional groups mismatch")),
     };
     let axis_count = SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
         input_size: 1,
         ft_size: 1,
         l1_hidden: 1,
@@ -9865,7 +9877,7 @@ mod tests {
     #[test]
     fn sfnn_workspace_layout_counts_forward_activations() {
         let shape = SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -9924,7 +9936,7 @@ mod tests {
     #[test]
     fn sfnn_shape_validation_allows_progress_multiplier_for_axis_factorizer() {
         let shape = SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -9954,7 +9966,7 @@ mod tests {
     #[test]
     fn sfnn_backward_workspace_layout_counts_gradients() {
         let shape = SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -9997,7 +10009,7 @@ mod tests {
     #[test]
     fn sfnn_grouped_l1w_layout_is_compact() {
         let shape = SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
             input_size: 133578,
             ft_size: 8192,
             l1_hidden: 15,
@@ -10028,7 +10040,7 @@ mod tests {
     #[test]
     fn sfnn_common_shard_l1w_layout_is_compact() {
         let shape = SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
             input_size: 1791,
             ft_size: 3072,
             l1_hidden: 7,
@@ -10056,7 +10068,7 @@ mod tests {
         assert!(shape.l1w_len().unwrap() < shape.num_stacks * shape.l1_out() * shape.ft_size);
 
         let c0_shape = SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
             input_size: 133578,
             ft_size: 8192,
             l1_hidden: 7,
@@ -10240,7 +10252,7 @@ mod tests {
         }
 
         let shape = SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -10699,7 +10711,7 @@ mod tests {
 
     fn tiny_sfnn_shape() -> SfnnForwardShape {
         SfnnForwardShape {
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,

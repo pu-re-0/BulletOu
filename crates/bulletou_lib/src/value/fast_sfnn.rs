@@ -24,7 +24,29 @@ pub struct SfnnForwardShape {
     pub l2_size: usize,
     pub num_stacks: usize,
     pub l1_group_count: usize,
-    pub band2_block_permute: bool,
+    pub post_pairwise_transform: PostPairwiseTransform,
+}
+
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostPairwiseTransform {
+    Identity = 0,
+    ScaleHalf = 1,
+    Band2RotateHalf = 2,
+    Band2RotateFull = 3,
+}
+
+impl TryFrom<i32> for PostPairwiseTransform {
+    type Error = FastSfnnError;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Identity),
+            1 => Ok(Self::ScaleHalf),
+            2 => Ok(Self::Band2RotateHalf),
+            3 => Ok(Self::Band2RotateFull),
+            _ => Err(FastSfnnError::Shape(format!("invalid post-pairwise transform mode {value}"))),
+        }
+    }
 }
 
 pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
@@ -35,7 +57,7 @@ pub const SFNN_HALFKA2_1024_7_64_K3K3: SfnnForwardShape = SfnnForwardShape {
     l2_size: 64,
     num_stacks: 9,
     l1_group_count: 1,
-    band2_block_permute: false,
+    post_pairwise_transform: PostPairwiseTransform::Identity,
 };
 
 pub const SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE: usize = HALFKA2_DIMENSIONS + PIECE_INPUTS;
@@ -104,6 +126,53 @@ pub fn sfnn_band2_block_permute_backward(values: &[f32], output_gradients: &[f32
         }
     }
     Ok(gradients)
+}
+
+pub fn sfnn_post_pairwise_float(values: &[f32], mode: PostPairwiseTransform) -> Result<Vec<f32>, FastSfnnError> {
+    match mode {
+        PostPairwiseTransform::Identity => Ok(values.to_vec()),
+        PostPairwiseTransform::ScaleHalf => Ok(values.iter().map(|&value| (0.5 * value).clamp(0.0, SFNN_BAND2_FLOAT_WIDTH)).collect()),
+        PostPairwiseTransform::Band2RotateHalf => sfnn_band2_block_permute_float(values),
+        PostPairwiseTransform::Band2RotateFull => Ok(sfnn_band2_block_permute_float(values)?.into_iter().map(|value| 2.0 * value).collect()),
+    }
+}
+
+pub fn sfnn_post_pairwise_integer(values: &[u8], mode: PostPairwiseTransform) -> Result<Vec<u8>, FastSfnnError> {
+    match mode {
+        PostPairwiseTransform::Identity => Ok(values.to_vec()),
+        PostPairwiseTransform::ScaleHalf => Ok(values.iter().map(|value| value / 2).collect()),
+        PostPairwiseTransform::Band2RotateHalf => sfnn_band2_block_permute_integer(values),
+        PostPairwiseTransform::Band2RotateFull => {
+            if values.len() % SFNN_BAND2_BLOCK_SIZE != 0 {
+                return Err(FastSfnnError::Shape("band2 perspective length is not a complete block".to_string()));
+            }
+            let low: Vec<_> = values.iter().map(|&v| v.min(SFNN_BAND2_INTEGER_WIDTH)).collect();
+            let high: Vec<_> = values.iter().map(|&v| v.saturating_sub(SFNN_BAND2_INTEGER_WIDTH).min(SFNN_BAND2_INTEGER_WIDTH)).collect();
+            Ok(low.into_iter().zip(rotate_u8_left(&high)).map(|(u, r)| (u16::from(u) + u16::from(r)) as u8).collect())
+        }
+    }
+}
+
+fn rotate_u8_left(values: &[u8]) -> Vec<u8> {
+    let mut out = vec![0; values.len()];
+    for block in (0..values.len()).step_by(SFNN_BAND2_BLOCK_SIZE) {
+        for offset in 0..SFNN_BAND2_BLOCK_SIZE {
+            out[block + offset] = values[block + (offset + 1) % SFNN_BAND2_BLOCK_SIZE];
+        }
+    }
+    out
+}
+
+pub fn sfnn_post_pairwise_backward(values: &[f32], gradients: &[f32], mode: PostPairwiseTransform) -> Result<Vec<f32>, FastSfnnError> {
+    match mode {
+        PostPairwiseTransform::Identity => Ok(gradients.to_vec()),
+        PostPairwiseTransform::ScaleHalf => {
+            if values.len() != gradients.len() { return Err(FastSfnnError::Shape("post-pairwise backward length mismatch".to_string())); }
+            Ok(values.iter().zip(gradients).map(|(&v, &g)| if v > 0.0 && v < 2.0 * SFNN_BAND2_FLOAT_WIDTH { 0.5 * g } else { 0.0 }).collect())
+        }
+        PostPairwiseTransform::Band2RotateHalf => sfnn_band2_block_permute_backward(values, gradients),
+        PostPairwiseTransform::Band2RotateFull => Ok(sfnn_band2_block_permute_backward(values, gradients)?.into_iter().map(|value| 2.0 * value).collect()),
+    }
 }
 
 impl SfnnForwardShape {
@@ -447,9 +516,10 @@ impl<'a> SfnnForwardWeights<'a> {
             crelu_in_place(nstm_l0);
             pairwise_mul_scaled(stm_l0, &mut trace.combined[combined_start..combined_mid]);
             pairwise_mul_scaled(nstm_l0, &mut trace.combined[combined_mid..combined_end]);
-            if shape.band2_block_permute {
+            if shape.post_pairwise_transform != PostPairwiseTransform::Identity {
                 for perspective in [combined_start..combined_mid, combined_mid..combined_end] {
-                    let transformed = sfnn_band2_block_permute_float(&trace.combined[perspective.clone()])?;
+                    let transformed = sfnn_post_pairwise_float(
+                        &trace.combined[perspective.clone()], shape.post_pairwise_transform)?;
                     trace.combined[perspective].copy_from_slice(&transformed);
                 }
             }
@@ -634,7 +704,7 @@ mod tests {
             l2_size: 3,
             num_stacks: 2,
             l1_group_count: 1,
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
         };
         let layout = SfnnForwardWorkspaceLayout::new(shape, 5);
 
@@ -758,7 +828,7 @@ mod tests {
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
         };
 
         let err = shape.validate().unwrap_err();
@@ -773,6 +843,56 @@ mod tests {
             sfnn_band2_block_permute_integer(&input).unwrap(),
             vec![0, 0, 31, 31, 62, 63, 63, 32]
         );
+    }
+
+    #[test]
+    fn all_post_pairwise_integer_modes_cover_fixed_vector_and_ranges() {
+        let input = [0, 0, 62, 63, 64, 125, 126, 127];
+        assert_eq!(sfnn_post_pairwise_integer(&input, PostPairwiseTransform::Identity).unwrap(), input);
+        assert_eq!(
+            sfnn_post_pairwise_integer(&input, PostPairwiseTransform::ScaleHalf).unwrap(),
+            [0, 0, 31, 31, 32, 62, 63, 63]
+        );
+        assert_eq!(
+            sfnn_post_pairwise_integer(&input, PostPairwiseTransform::Band2RotateHalf).unwrap(),
+            [0, 0, 31, 31, 62, 63, 63, 32]
+        );
+        assert_eq!(
+            sfnn_post_pairwise_integer(&input, PostPairwiseTransform::Band2RotateFull).unwrap(),
+            [0, 0, 62, 63, 125, 126, 126, 64]
+        );
+        for value in 0..=126u8 {
+            assert!(sfnn_post_pairwise_integer(&[value; 4], PostPairwiseTransform::ScaleHalf)
+                .unwrap().into_iter().all(|v| v <= 63));
+            assert!(sfnn_post_pairwise_integer(&[value; 4], PostPairwiseTransform::Band2RotateFull)
+                .unwrap().into_iter().all(|v| v <= 126));
+        }
+        assert!(PostPairwiseTransform::try_from(4).is_err());
+    }
+
+    #[test]
+    fn all_post_pairwise_backward_modes_match_finite_difference_and_zero_boundaries() {
+        let values = [0.1, 0.3, 0.6, 0.9];
+        let output_gradients = [0.3, -0.2, 0.7, 1.1];
+        for mode in [PostPairwiseTransform::Identity, PostPairwiseTransform::ScaleHalf,
+                     PostPairwiseTransform::Band2RotateHalf, PostPairwiseTransform::Band2RotateFull] {
+            let analytic = sfnn_post_pairwise_backward(&values, &output_gradients, mode).unwrap();
+            let objective = |xs: &[f32]| sfnn_post_pairwise_float(xs, mode).unwrap().iter()
+                .zip(output_gradients).map(|(v, g)| v * g).sum::<f32>();
+            for index in 0..values.len() {
+                let mut plus = values;
+                let mut minus = values;
+                plus[index] += 1.0e-3;
+                minus[index] -= 1.0e-3;
+                let numeric = (objective(&plus) - objective(&minus)) / 2.0e-3;
+                assert!((numeric - analytic[index]).abs() < 2.0e-4, "mode={mode:?} index={index}");
+            }
+        }
+        let p = SFNN_BAND2_FLOAT_WIDTH;
+        assert_eq!(sfnn_post_pairwise_backward(&[0.0, 2.0 * p], &[1.0, 1.0],
+                                               PostPairwiseTransform::ScaleHalf).unwrap(), [0.0, 0.0]);
+        assert_eq!(sfnn_post_pairwise_backward(&[0.0, p, 2.0 * p, p], &[1.0; 4],
+                                               PostPairwiseTransform::Band2RotateFull).unwrap(), [0.0; 4]);
     }
 
     #[test]
@@ -818,10 +938,10 @@ mod tests {
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
         };
         let mut band2_shape = baseline_shape;
-        band2_shape.band2_block_permute = true;
+        band2_shape.post_pairwise_transform = PostPairwiseTransform::Band2RotateHalf;
         let make_weights = |shape| SfnnForwardOwnedWeights {
             shape,
             l0w: vec![0.0; shape.input_size * shape.ft_size],
@@ -856,7 +976,7 @@ mod tests {
             l2_size: 2,
             num_stacks: 2,
             l1_group_count: 1,
-            band2_block_permute: false,
+            post_pairwise_transform: PostPairwiseTransform::Identity,
         }
     }
 

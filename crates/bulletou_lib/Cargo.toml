@@ -31,6 +31,7 @@ threat-profile-same-class-major-pawn = []
 clap = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [[example]]
 name = "simple"

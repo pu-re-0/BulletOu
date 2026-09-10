@@ -1033,12 +1033,13 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     combined[l0_base + pairwise + pair] = nstm0 * nstm1 * SFNN_PAIRWISE_SCALE;
 }
 
-__global__ void sfnn_band2_block_permute_forward_kernel(
+__global__ void sfnn_post_pairwise_forward_kernel(
     const float* stm_l0,
     const float* nstm_l0,
     float* combined,
     size_t batch,
-    size_t ft_size) {
+    size_t ft_size,
+    int mode) {
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t pairwise = ft_size / 2;
     const size_t total = batch * ft_size;
@@ -1054,10 +1055,16 @@ __global__ void sfnn_band2_block_permute_forward_kernel(
         activations[base + index] * activations[base + pairwise + index] * SFNN_PAIRWISE_SCALE;
     const float next_value =
         activations[base + next] * activations[base + pairwise + next] * SFNN_PAIRWISE_SCALE;
+    if (mode == 1) {
+        combined[base + perspective * pairwise + index] =
+            fminf(fmaxf(0.5f * current_value, 0.0f), SFNN_BAND2_WIDTH);
+        return;
+    }
     const float low = fminf(fmaxf(current_value, 0.0f), SFNN_BAND2_WIDTH);
     const float rotated_high =
         fminf(fmaxf(next_value - SFNN_BAND2_WIDTH, 0.0f), SFNN_BAND2_WIDTH);
-    combined[base + perspective * pairwise + index] = 0.5f * (low + rotated_high);
+    const float scale = mode == 2 ? 0.5f : 1.0f;
+    combined[base + perspective * pairwise + index] = scale * (low + rotated_high);
 }
 
 __global__ void sfnn_fold_halfka2_l0w_kernel(
@@ -3606,14 +3613,15 @@ __global__ void sfnn_pairwise_backward_kernel(
         combined_gradients[combined_base + pairwise + pair] * nstm_l0[l0_base + mate_col] * SFNN_PAIRWISE_SCALE;
 }
 
-__global__ void sfnn_band2_pairwise_backward_kernel(
+__global__ void sfnn_post_pairwise_backward_kernel(
     const float* stm_l0,
     const float* nstm_l0,
     const float* combined_gradients,
     float* stm_gradients,
     float* nstm_gradients,
     size_t batch,
-    size_t ft_size) {
+    size_t ft_size,
+    int mode) {
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t total = batch * ft_size;
     if (tid >= total) return;
@@ -3629,14 +3637,24 @@ __global__ void sfnn_band2_pairwise_backward_kernel(
     const float nstm_value = nstm_l0[base + pair] * nstm_l0[base + pairwise + pair] * SFNN_PAIRWISE_SCALE;
     float stm_pair_grad = 0.0f;
     float nstm_pair_grad = 0.0f;
+    if (mode == 1) {
+        if (stm_value > 0.0f && stm_value < 2.0f * SFNN_BAND2_WIDTH)
+            stm_pair_grad = 0.5f * combined_gradients[base + pair];
+        if (nstm_value > 0.0f && nstm_value < 2.0f * SFNN_BAND2_WIDTH)
+            nstm_pair_grad = 0.5f * combined_gradients[base + pairwise + pair];
+        stm_gradients[tid] = stm_pair_grad * stm_l0[base + mate_col] * SFNN_PAIRWISE_SCALE;
+        nstm_gradients[tid] = nstm_pair_grad * nstm_l0[base + mate_col] * SFNN_PAIRWISE_SCALE;
+        return;
+    }
+    const float scale = mode == 2 ? 0.5f : 1.0f;
     if (stm_value > 0.0f && stm_value < SFNN_BAND2_WIDTH)
-        stm_pair_grad += 0.5f * combined_gradients[base + pair];
+        stm_pair_grad += scale * combined_gradients[base + pair];
     if (stm_value > SFNN_BAND2_WIDTH && stm_value < 2.0f * SFNN_BAND2_WIDTH)
-        stm_pair_grad += 0.5f * combined_gradients[base + previous];
+        stm_pair_grad += scale * combined_gradients[base + previous];
     if (nstm_value > 0.0f && nstm_value < SFNN_BAND2_WIDTH)
-        nstm_pair_grad += 0.5f * combined_gradients[base + pairwise + pair];
+        nstm_pair_grad += scale * combined_gradients[base + pairwise + pair];
     if (nstm_value > SFNN_BAND2_WIDTH && nstm_value < 2.0f * SFNN_BAND2_WIDTH)
-        nstm_pair_grad += 0.5f * combined_gradients[base + pairwise + previous];
+        nstm_pair_grad += scale * combined_gradients[base + pairwise + previous];
 
     stm_gradients[tid] = stm_pair_grad * stm_l0[base + mate_col] * SFNN_PAIRWISE_SCALE;
     nstm_gradients[tid] = nstm_pair_grad * nstm_l0[base + mate_col] * SFNN_PAIRWISE_SCALE;
@@ -5035,12 +5053,15 @@ int launch_sfnn_forward_kernels(
         if (pairwise % 4 != 0) {
             return fail_message("SFNN band2 block permutation requires each perspective width divisible by 4");
         }
-        if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_band2_block_permute_forward_kernel") != 0) {
+        if (band2_block_permute < 1 || band2_block_permute > 3) {
+            return fail_message("SFNN post-pairwise transform mode must be in 0..3");
+        }
+        if (block_count_1d(batch * ft_size, threads, &blocks, "sfnn_post_pairwise_forward_kernel") != 0) {
             return -1;
         }
-        sfnn_band2_block_permute_forward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-            stm_l0, nstm_l0, combined, batch, ft_size);
-        if (check_kernel_launch("sfnn_band2_block_permute_forward_kernel launch") != 0) {
+        sfnn_post_pairwise_forward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            stm_l0, nstm_l0, combined, batch, ft_size, band2_block_permute);
+        if (check_kernel_launch("sfnn_post_pairwise_forward_kernel launch") != 0) {
             return -1;
         }
     }
@@ -6650,8 +6671,9 @@ int launch_sfnn_backward_kernels(
             return -1;
         }
         if (band2_block_permute != 0) {
-            sfnn_band2_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-                stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients, batch, ft_size);
+            sfnn_post_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients,
+                batch, ft_size, band2_block_permute);
         } else {
             sfnn_pairwise_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
                 stm_l0, nstm_l0, combined_gradients, stm_l0_gradients, nstm_l0_gradients, batch, ft_size);
