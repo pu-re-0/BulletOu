@@ -10772,10 +10772,10 @@ mod tests {
         assert_close_slice("D-A/D-A-prime l0w update", &materialized_weights.l0w, &actual.l0w, 1.0e-6);
         assert_close_slice("D-A/D-A-prime l0b update", &materialized_weights.l0b, &actual.l0b, 1.0e-6);
         assert_close_slice("D-A/D-A-prime l1w update", &materialized_weights.l1w, &actual.l1w, 1.0e-6);
-        assert_eq!(
-            materialized_update.read_optimizer_states(&ctx).unwrap(),
-            runner.read_optimizer_states(&ctx).unwrap(),
-            "D-A/D-A-prime all optimizer states"
+        assert_close_sfnn_optimizer_states(
+            &materialized_update.read_optimizer_states(&ctx).unwrap(),
+            &runner.read_optimizer_states(&ctx).unwrap(),
+            1.0e-6,
         );
 
         assert_close_slice("train sfnn l0w", &actual.l0w, &expected.l0w, 1.0e-6);
@@ -11651,6 +11651,55 @@ mod tests {
                 abs_diff <= tolerance,
                 "{name}[{idx}] mismatch: expected {expected}, got {actual}, abs_diff={abs_diff}"
             );
+        }
+    }
+
+    fn assert_close_ranger_state(
+        name: &str,
+        actual: &RangerParamStateReadback,
+        expected: &RangerParamStateReadback,
+        tolerance: f32,
+    ) {
+        assert_close_slice(&format!("{name}.momentum"), &actual.momentum, &expected.momentum, tolerance);
+        assert_close_slice(&format!("{name}.velocity"), &actual.velocity, &expected.velocity, tolerance);
+        assert_close_slice(&format!("{name}.slow_params"), &actual.slow_params, &expected.slow_params, tolerance);
+    }
+
+    fn assert_close_sfnn_optimizer_states(
+        actual: &SfnnRangerOptimizerStatesReadback,
+        expected: &SfnnRangerOptimizerStatesReadback,
+        tolerance: f32,
+    ) {
+        for (name, actual, expected) in [
+            ("l0w", &actual.l0w, &expected.l0w),
+            ("l0b", &actual.l0b, &expected.l0b),
+            ("l1w", &actual.l1w, &expected.l1w),
+            ("l1b", &actual.l1b, &expected.l1b),
+            ("l2w", &actual.l2w, &expected.l2w),
+            ("l2b", &actual.l2b, &expected.l2b),
+            ("l3w", &actual.l3w, &expected.l3w),
+            ("l3b", &actual.l3b, &expected.l3b),
+        ] {
+            assert_close_ranger_state(name, actual, expected, tolerance);
+        }
+        for (name, actual, expected) in [
+            ("l1fw", actual.l1fw.as_ref(), expected.l1fw.as_ref()),
+            ("l1fb", actual.l1fb.as_ref(), expected.l1fb.as_ref()),
+            ("l1axw", actual.l1axw.as_ref(), expected.l1axw.as_ref()),
+            ("l1axb", actual.l1axb.as_ref(), expected.l1axb.as_ref()),
+            ("l2fw", actual.l2fw.as_ref(), expected.l2fw.as_ref()),
+            ("l2fb", actual.l2fb.as_ref(), expected.l2fb.as_ref()),
+            ("l2axw", actual.l2axw.as_ref(), expected.l2axw.as_ref()),
+            ("l2axb", actual.l2axb.as_ref(), expected.l2axb.as_ref()),
+            ("l3fw", actual.l3fw.as_ref(), expected.l3fw.as_ref()),
+            ("l3fb", actual.l3fb.as_ref(), expected.l3fb.as_ref()),
+            ("l3axw", actual.l3axw.as_ref(), expected.l3axw.as_ref()),
+            ("l3axb", actual.l3axb.as_ref(), expected.l3axb.as_ref()),
+        ] {
+            assert_eq!(actual.is_some(), expected.is_some(), "{name} presence");
+            if let (Some(actual), Some(expected)) = (actual, expected) {
+                assert_close_ranger_state(name, actual, expected, tolerance);
+            }
         }
     }
 

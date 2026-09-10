@@ -25419,7 +25419,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_saturation_threshold=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
     ensure_line_after(&mut out, "sfnn_freeze_progress=", "sfnn_freeze_l1=", "sfnn_freeze_progress=false");
-    ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_progress=", "sfnn_update_scope=all");
+    ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_l0_backward=", "sfnn_update_scope=all");
 
     let mut normalized = out.join("\n");
     normalized.push('\n');
@@ -32664,6 +32664,11 @@ mod tests {
         let old_signature = resume_signature_without_line(&resume_signature(&args), "sfnn_update_scope=");
 
         assert!(resume_signature_matches(&old_signature, &args));
+
+        let without_path = resume_signature_without_line(&resume_signature(&args), "sfnn_l0_backward=");
+        assert!(resume_signature_matches(&without_path, &args));
+        let without_both = resume_signature_without_line(&without_path, "sfnn_update_scope=");
+        assert!(resume_signature_matches(&without_both, &args));
     }
 
     #[test]
