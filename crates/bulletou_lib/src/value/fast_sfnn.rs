@@ -131,9 +131,13 @@ pub fn sfnn_band2_block_permute_backward(values: &[f32], output_gradients: &[f32
 pub fn sfnn_post_pairwise_float(values: &[f32], mode: PostPairwiseTransform) -> Result<Vec<f32>, FastSfnnError> {
     match mode {
         PostPairwiseTransform::Identity => Ok(values.to_vec()),
-        PostPairwiseTransform::ScaleHalf => Ok(values.iter().map(|&value| (0.5 * value).clamp(0.0, SFNN_BAND2_FLOAT_WIDTH)).collect()),
+        PostPairwiseTransform::ScaleHalf => {
+            Ok(values.iter().map(|&value| (0.5 * value).clamp(0.0, SFNN_BAND2_FLOAT_WIDTH)).collect())
+        }
         PostPairwiseTransform::Band2RotateHalf => sfnn_band2_block_permute_float(values),
-        PostPairwiseTransform::Band2RotateFull => Ok(sfnn_band2_block_permute_float(values)?.into_iter().map(|value| 2.0 * value).collect()),
+        PostPairwiseTransform::Band2RotateFull => {
+            Ok(sfnn_band2_block_permute_float(values)?.into_iter().map(|value| 2.0 * value).collect())
+        }
     }
 }
 
@@ -147,7 +151,10 @@ pub fn sfnn_post_pairwise_integer(values: &[u8], mode: PostPairwiseTransform) ->
                 return Err(FastSfnnError::Shape("band2 perspective length is not a complete block".to_string()));
             }
             let low: Vec<_> = values.iter().map(|&v| v.min(SFNN_BAND2_INTEGER_WIDTH)).collect();
-            let high: Vec<_> = values.iter().map(|&v| v.saturating_sub(SFNN_BAND2_INTEGER_WIDTH).min(SFNN_BAND2_INTEGER_WIDTH)).collect();
+            let high: Vec<_> = values
+                .iter()
+                .map(|&v| v.saturating_sub(SFNN_BAND2_INTEGER_WIDTH).min(SFNN_BAND2_INTEGER_WIDTH))
+                .collect();
             Ok(low.into_iter().zip(rotate_u8_left(&high)).map(|(u, r)| (u16::from(u) + u16::from(r)) as u8).collect())
         }
     }
@@ -163,15 +170,27 @@ fn rotate_u8_left(values: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn sfnn_post_pairwise_backward(values: &[f32], gradients: &[f32], mode: PostPairwiseTransform) -> Result<Vec<f32>, FastSfnnError> {
+pub fn sfnn_post_pairwise_backward(
+    values: &[f32],
+    gradients: &[f32],
+    mode: PostPairwiseTransform,
+) -> Result<Vec<f32>, FastSfnnError> {
     match mode {
         PostPairwiseTransform::Identity => Ok(gradients.to_vec()),
         PostPairwiseTransform::ScaleHalf => {
-            if values.len() != gradients.len() { return Err(FastSfnnError::Shape("post-pairwise backward length mismatch".to_string())); }
-            Ok(values.iter().zip(gradients).map(|(&v, &g)| if v > 0.0 && v < 2.0 * SFNN_BAND2_FLOAT_WIDTH { 0.5 * g } else { 0.0 }).collect())
+            if values.len() != gradients.len() {
+                return Err(FastSfnnError::Shape("post-pairwise backward length mismatch".to_string()));
+            }
+            Ok(values
+                .iter()
+                .zip(gradients)
+                .map(|(&v, &g)| if v > 0.0 && v < 2.0 * SFNN_BAND2_FLOAT_WIDTH { 0.5 * g } else { 0.0 })
+                .collect())
         }
         PostPairwiseTransform::Band2RotateHalf => sfnn_band2_block_permute_backward(values, gradients),
-        PostPairwiseTransform::Band2RotateFull => Ok(sfnn_band2_block_permute_backward(values, gradients)?.into_iter().map(|value| 2.0 * value).collect()),
+        PostPairwiseTransform::Band2RotateFull => {
+            Ok(sfnn_band2_block_permute_backward(values, gradients)?.into_iter().map(|value| 2.0 * value).collect())
+        }
     }
 }
 
@@ -518,8 +537,8 @@ impl<'a> SfnnForwardWeights<'a> {
             pairwise_mul_scaled(nstm_l0, &mut trace.combined[combined_mid..combined_end]);
             if shape.post_pairwise_transform != PostPairwiseTransform::Identity {
                 for perspective in [combined_start..combined_mid, combined_mid..combined_end] {
-                    let transformed = sfnn_post_pairwise_float(
-                        &trace.combined[perspective.clone()], shape.post_pairwise_transform)?;
+                    let transformed =
+                        sfnn_post_pairwise_float(&trace.combined[perspective.clone()], shape.post_pairwise_transform)?;
                     trace.combined[perspective].copy_from_slice(&transformed);
                 }
             }
@@ -839,10 +858,7 @@ mod tests {
     #[test]
     fn band2_integer_contract_covers_boundaries_and_blocks() {
         let input = [0, 1, 62, 63, 64, 125, 126, 127];
-        assert_eq!(
-            sfnn_band2_block_permute_integer(&input).unwrap(),
-            vec![0, 0, 31, 31, 62, 63, 63, 32]
-        );
+        assert_eq!(sfnn_band2_block_permute_integer(&input).unwrap(), vec![0, 0, 31, 31, 62, 63, 63, 32]);
     }
 
     #[test]
@@ -862,10 +878,18 @@ mod tests {
             [0, 0, 62, 63, 125, 126, 126, 64]
         );
         for value in 0..=126u8 {
-            assert!(sfnn_post_pairwise_integer(&[value; 4], PostPairwiseTransform::ScaleHalf)
-                .unwrap().into_iter().all(|v| v <= 63));
-            assert!(sfnn_post_pairwise_integer(&[value; 4], PostPairwiseTransform::Band2RotateFull)
-                .unwrap().into_iter().all(|v| v <= 126));
+            assert!(
+                sfnn_post_pairwise_integer(&[value; 4], PostPairwiseTransform::ScaleHalf)
+                    .unwrap()
+                    .into_iter()
+                    .all(|v| v <= 63)
+            );
+            assert!(
+                sfnn_post_pairwise_integer(&[value; 4], PostPairwiseTransform::Band2RotateFull)
+                    .unwrap()
+                    .into_iter()
+                    .all(|v| v <= 126)
+            );
         }
         assert!(PostPairwiseTransform::try_from(4).is_err());
     }
@@ -874,11 +898,21 @@ mod tests {
     fn all_post_pairwise_backward_modes_match_finite_difference_and_zero_boundaries() {
         let values = [0.1, 0.3, 0.6, 0.9];
         let output_gradients = [0.3, -0.2, 0.7, 1.1];
-        for mode in [PostPairwiseTransform::Identity, PostPairwiseTransform::ScaleHalf,
-                     PostPairwiseTransform::Band2RotateHalf, PostPairwiseTransform::Band2RotateFull] {
+        for mode in [
+            PostPairwiseTransform::Identity,
+            PostPairwiseTransform::ScaleHalf,
+            PostPairwiseTransform::Band2RotateHalf,
+            PostPairwiseTransform::Band2RotateFull,
+        ] {
             let analytic = sfnn_post_pairwise_backward(&values, &output_gradients, mode).unwrap();
-            let objective = |xs: &[f32]| sfnn_post_pairwise_float(xs, mode).unwrap().iter()
-                .zip(output_gradients).map(|(v, g)| v * g).sum::<f32>();
+            let objective = |xs: &[f32]| {
+                sfnn_post_pairwise_float(xs, mode)
+                    .unwrap()
+                    .iter()
+                    .zip(output_gradients)
+                    .map(|(v, g)| v * g)
+                    .sum::<f32>()
+            };
             for index in 0..values.len() {
                 let mut plus = values;
                 let mut minus = values;
@@ -889,10 +923,15 @@ mod tests {
             }
         }
         let p = SFNN_BAND2_FLOAT_WIDTH;
-        assert_eq!(sfnn_post_pairwise_backward(&[0.0, 2.0 * p], &[1.0, 1.0],
-                                               PostPairwiseTransform::ScaleHalf).unwrap(), [0.0, 0.0]);
-        assert_eq!(sfnn_post_pairwise_backward(&[0.0, p, 2.0 * p, p], &[1.0; 4],
-                                               PostPairwiseTransform::Band2RotateFull).unwrap(), [0.0; 4]);
+        assert_eq!(
+            sfnn_post_pairwise_backward(&[0.0, 2.0 * p], &[1.0, 1.0], PostPairwiseTransform::ScaleHalf).unwrap(),
+            [0.0, 0.0]
+        );
+        assert_eq!(
+            sfnn_post_pairwise_backward(&[0.0, p, 2.0 * p, p], &[1.0; 4], PostPairwiseTransform::Band2RotateFull)
+                .unwrap(),
+            [0.0; 4]
+        );
     }
 
     #[test]

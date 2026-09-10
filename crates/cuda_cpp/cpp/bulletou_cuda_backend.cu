@@ -5905,7 +5905,8 @@ int launch_sfnn_inverse_index_l0_backward(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size,
+    int add_to_existing) {
     constexpr int threads = 256;
     int blocks = 0;
     if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_pregrad_kernel") != 0) {
@@ -5939,7 +5940,7 @@ int launch_sfnn_inverse_index_l0_backward(
             max_active,
             n_features,
             ft_size,
-            0) != 0 ||
+            add_to_existing) != 0 ||
         launch_sfnn_inverse_index_for_perspective(
             ctx,
             nstm_indices,
@@ -6090,6 +6091,11 @@ int launch_sfnn_backward_kernels(
     if ((grouped_l1 || common_shard_l1) && (has_l1f != 0 || has_l1ax != 0)) {
         return fail_message("SFNN compact L1 does not support factorized L1");
     }
+    if ((fuse_pairwise_l0 != 0 && fuse_pairwise_l0 != 1) ||
+        (fuse_pairwise_l0 != 0 && band2_block_permute != 0)) {
+        return fail_message(
+            "invalid resolved SFNN L0 backward path: inverse-index requires identity post-pairwise transform");
+    }
     constexpr int threads = 256;
     int blocks = 0;
     SfnnBackwardProfileEvents profile;
@@ -6136,7 +6142,7 @@ int launch_sfnn_backward_kernels(
                 l3fb_gradients,
                 l3axw_gradients,
                 l3axb_gradients,
-                (fuse_pairwise_l0 == 0 || band2_block_permute != 0) ? 1 : 0) != 0) {
+                fuse_pairwise_l0 == 0 ? 1 : 0) != 0) {
             return -1;
         }
     }
@@ -6648,7 +6654,7 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
-    if (fuse_pairwise_l0 != 0 && band2_block_permute == 0) {
+    if (fuse_pairwise_l0 != 0) {
         if (launch_sfnn_inverse_index_l0_backward(
                 ctx,
                 stm_indices,
@@ -6663,7 +6669,8 @@ int launch_sfnn_backward_kernels(
                 batch,
                 max_active,
                 input_size,
-                ft_size) != 0) {
+                ft_size,
+                zero_parameter_gradients == 0 ? 1 : 0) != 0) {
             return -1;
         }
     } else {
@@ -9842,6 +9849,7 @@ int sfnn_backward_train_device_impl(
     BulletOuCudaCppF32Buffer* l3axw_gradients,
     BulletOuCudaCppF32Buffer* l3axb_gradients,
     int zero_parameter_gradients,
+    int resolved_use_fused_l0,
     float* profile_ms,
     size_t profile_ms_len) {
     const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
@@ -10048,7 +10056,7 @@ int sfnn_backward_train_device_impl(
             l3axw_gradients->ptr,
             l3axb_gradients->ptr,
             zero_parameter_gradients,
-            1,
+            resolved_use_fused_l0,
             profile_ms,
             profile_ms_len) != 0) {
         return -1;
@@ -10139,7 +10147,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     BulletOuCudaCppF32Buffer* l3fb_gradients,
     BulletOuCudaCppF32Buffer* l3axw_gradients,
     BulletOuCudaCppF32Buffer* l3axb_gradients,
-    int zero_parameter_gradients) {
+    int zero_parameter_gradients,
+    int resolved_use_fused_l0) {
     const size_t axis_count = sfnn_factorizer_axis_count(
         num_stacks,
         factorizer_king_axis_dim,
@@ -10246,6 +10255,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         l3axw_gradients,
         l3axb_gradients,
         zero_parameter_gradients,
+        resolved_use_fused_l0,
         nullptr,
         0);
 }
@@ -10333,6 +10343,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     BulletOuCudaCppF32Buffer* l3axw_gradients,
     BulletOuCudaCppF32Buffer* l3axb_gradients,
     int zero_parameter_gradients,
+    int resolved_use_fused_l0,
     float* profile_ms,
     size_t profile_ms_len) {
     const size_t axis_count = sfnn_factorizer_axis_count(
@@ -10441,6 +10452,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         l3axw_gradients,
         l3axb_gradients,
         zero_parameter_gradients,
+        resolved_use_fused_l0,
         profile_ms,
         profile_ms_len);
 }

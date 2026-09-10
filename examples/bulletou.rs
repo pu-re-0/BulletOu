@@ -702,27 +702,69 @@ enum PostPairwiseTransform {
     Band2RotateFull,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SfnnL0BackwardSelectorArg {
+    Auto,
+    InverseIndex,
+    MaterializedSparse,
+}
+
+impl SfnnL0BackwardSelectorArg {
+    #[cfg(feature = "cuda-cpp-backend")]
+    fn cuda(self) -> bulletou_cuda_cpp::SfnnL0BackwardSelector {
+        match self {
+            Self::Auto => bulletou_cuda_cpp::SfnnL0BackwardSelector::Auto,
+            Self::InverseIndex => bulletou_cuda_cpp::SfnnL0BackwardSelector::InverseIndex,
+            Self::MaterializedSparse => bulletou_cuda_cpp::SfnnL0BackwardSelector::MaterializedSparse,
+        }
+    }
+
+    fn resolved_name(self, arch: NnueArch) -> Result<&'static str, String> {
+        match (self, arch.post_pairwise_transform == PostPairwiseTransform::Identity) {
+            (Self::Auto, true) | (Self::InverseIndex, true) => Ok("inverse-index"),
+            (Self::Auto, false) | (Self::MaterializedSparse, _) => Ok("materialized-sparse"),
+            (Self::InverseIndex, false) => {
+                Err("--sfnn-l0-backward inverse-index requires an identity post-pairwise transform".to_string())
+            }
+        }
+    }
+}
+
 impl PostPairwiseTransform {
-    fn marker(self) -> f32 { match self { Self::Identity => 0.0, Self::ScaleHalf => 1.0, Self::Band2RotateHalf => 2.0, Self::Band2RotateFull => 3.0 } }
-    fn cli_suffix(self) -> &'static str { match self {
-        Self::Identity => "", Self::ScaleHalf => "_pairwise_scale_half",
-        Self::Band2RotateHalf => "_band2_block_permute",
-        Self::Band2RotateFull => "_band2_block_permute_no_half",
-    }}
+    fn marker(self) -> f32 {
+        match self {
+            Self::Identity => 0.0,
+            Self::ScaleHalf => 1.0,
+            Self::Band2RotateHalf => 2.0,
+            Self::Band2RotateFull => 3.0,
+        }
+    }
+    fn cli_suffix(self) -> &'static str {
+        match self {
+            Self::Identity => "",
+            Self::ScaleHalf => "_pairwise_scale_half",
+            Self::Band2RotateHalf => "_band2_block_permute",
+            Self::Band2RotateFull => "_band2_block_permute_no_half",
+        }
+    }
     #[cfg(feature = "cuda-cpp-backend")]
-    fn cuda(self) -> bulletou_cuda_cpp::PostPairwiseTransform { match self {
-        Self::Identity => bulletou_cuda_cpp::PostPairwiseTransform::Identity,
-        Self::ScaleHalf => bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf,
-        Self::Band2RotateHalf => bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf,
-        Self::Band2RotateFull => bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull,
-    }}
+    fn cuda(self) -> bulletou_cuda_cpp::PostPairwiseTransform {
+        match self {
+            Self::Identity => bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            Self::ScaleHalf => bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf,
+            Self::Band2RotateHalf => bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf,
+            Self::Band2RotateFull => bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull,
+        }
+    }
     #[cfg(feature = "cuda-cpp-backend")]
-    fn from_cuda(value: bulletou_cuda_cpp::PostPairwiseTransform) -> Self { match value {
-        bulletou_cuda_cpp::PostPairwiseTransform::Identity => Self::Identity,
-        bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf => Self::ScaleHalf,
-        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf => Self::Band2RotateHalf,
-        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull => Self::Band2RotateFull,
-    }}
+    fn from_cuda(value: bulletou_cuda_cpp::PostPairwiseTransform) -> Self {
+        match value {
+            bulletou_cuda_cpp::PostPairwiseTransform::Identity => Self::Identity,
+            bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf => Self::ScaleHalf,
+            bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf => Self::Band2RotateHalf,
+            bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull => Self::Band2RotateFull,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1090,7 +1132,9 @@ impl std::str::FromStr for NnueArch {
                     ));
                 }
                 let mut layerstack_end = tokens.len();
-                let transform = if tokens.get(tokens.len().saturating_sub(5)..) == Some(&["band2", "block", "permute", "no", "half"][..]) {
+                let transform = if tokens.get(tokens.len().saturating_sub(5)..)
+                    == Some(&["band2", "block", "permute", "no", "half"][..])
+                {
                     layerstack_end -= 5;
                     PostPairwiseTransform::Band2RotateFull
                 } else if tokens.get(tokens.len().saturating_sub(3)..) == Some(&["band2", "block", "permute"][..]) {
@@ -1099,7 +1143,9 @@ impl std::str::FromStr for NnueArch {
                 } else if tokens.get(tokens.len().saturating_sub(3)..) == Some(&["pairwise", "scale", "half"][..]) {
                     layerstack_end -= 3;
                     PostPairwiseTransform::ScaleHalf
-                } else { PostPairwiseTransform::Identity };
+                } else {
+                    PostPairwiseTransform::Identity
+                };
                 let layerstack_spec = tokens[layerstack_start..layerstack_end].join("_");
                 let layerstack = parse_sfnn_layerstack_spec(&layerstack_spec, s)?;
                 let arch = NnueArch::new(family, feature, l1, l2, l3, Some(layerstack));
@@ -4394,6 +4440,11 @@ struct Args {
     #[arg(long, default_value = "0")]
     cuda_cpp_device: i32,
 
+    /// Diagnostic selector for the SFNN CUDA L0 backward implementation.
+    /// `auto` preserves the architecture-dependent historical behavior.
+    #[arg(long, value_enum, default_value = "auto")]
+    sfnn_l0_backward: SfnnL0BackwardSelectorArg,
+
     /// Run the C++/CUDA backend bring-up smoke and exit.
     #[arg(long)]
     cuda_cpp_smoke: bool,
@@ -5252,6 +5303,12 @@ impl Args {
         }
 
         let eval_type = self.eval_type();
+        if self.sfnn_l0_backward != SfnnL0BackwardSelectorArg::Auto {
+            if !eval_type.uses_layerstack() {
+                return Err("--sfnn-l0-backward is supported only by the CUDA SFNN trainer".to_string());
+            }
+            self.sfnn_l0_backward.resolved_name(self.arch())?;
+        }
         if !matches!(
             eval_type,
             EvalType::Kppt
@@ -7178,7 +7235,8 @@ fn parse_quantized_sfnn_nn_bin(
         if hash != expected_network_hash && !accepts_legacy {
             return Err(format!(
                 "{}: SFNN stack {stack} network hash mismatch for --arch {}: expected 0x{expected_network_hash:08X}, got 0x{hash:08X}",
-                path.display(), arch.cli_name()
+                path.display(),
+                arch.cli_name()
             ));
         }
         if hash == NETWORK_HASH_SFNN_LEGACY_SUISHO11PLUS && stack == 0 {
@@ -9008,7 +9066,7 @@ fn cuda_cpp_sfnn_quantized_proxy_shape(
 ) -> bulletou_cuda_cpp::SfnnForwardShape {
     if cuda_cpp_sfnn_quantized_proxy_retains_factorizer(args, shape) {
         return bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: shape.post_pairwise_transform,
+            post_pairwise_transform: shape.post_pairwise_transform,
             input_size: feature_kind.base_input_size(),
             ft_size: shape.ft_size,
             l1_hidden: shape.l1_hidden,
@@ -10346,22 +10404,26 @@ impl WorkerSfnnSession {
         let factorizer_alpha = cuda_cpp_sfnn_factorizer_alpha(&args);
         let max_active = feature_kind.max_active();
         let mut runner = match initial_state.optimizer_states.as_ref() {
-            Some(optimizer_states) => bulletou_cuda_cpp::SfnnTrainStepRunner::with_optimizer_states_and_factorizer(
+            Some(optimizer_states) => {
+                bulletou_cuda_cpp::SfnnTrainStepRunner::with_optimizer_states_factorizer_and_l0_backward_selector(
+                    &ctx,
+                    initial_weights.as_host(),
+                    optimizer_states.as_host(),
+                    batch_size,
+                    max_active,
+                    factorizer_active,
+                    factorizer_alpha,
+                    args.sfnn_l0_backward.cuda(),
+                )
+            }
+            None => bulletou_cuda_cpp::SfnnTrainStepRunner::new_with_factorizer_and_l0_backward_selector(
                 &ctx,
                 initial_weights.as_host(),
-                optimizer_states.as_host(),
                 batch_size,
                 max_active,
                 factorizer_active,
                 factorizer_alpha,
-            ),
-            None => bulletou_cuda_cpp::SfnnTrainStepRunner::new_with_factorizer(
-                &ctx,
-                initial_weights.as_host(),
-                batch_size,
-                max_active,
-                factorizer_active,
-                factorizer_alpha,
+                args.sfnn_l0_backward.cuda(),
             ),
         }
         .map_err(|e| e.to_string())?;
@@ -10461,6 +10523,14 @@ impl WorkerSfnnSession {
     }
 
     fn apply_args_to_runner(&mut self, args: &Args, rebase_axis_factorizer: bool) -> Result<(), String> {
+        let requested_l0_backward_path = args.sfnn_l0_backward.cuda().resolve(self.shape).map_err(|e| e.to_string())?;
+        if requested_l0_backward_path != self.runner.l0_backward_path() {
+            return Err(format!(
+                "worker SFNN L0 backward path mismatch: session={:?}, trial={:?}; recreate the worker session",
+                self.runner.l0_backward_path(),
+                requested_l0_backward_path
+            ));
+        }
         let old_args = self.args.clone();
         let new_count_settings = Self::compute_count_settings(args, self.shape)?;
         if rebase_axis_factorizer {
@@ -12629,11 +12699,8 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
         // can fuse arithmetic. This smoke qualifies the same update, not
         // bitwise identity across processors.
         const RANGER_SMOKE_ABS_TOLERANCE: f32 = 1.0e-6;
-        let max_abs_delta = weights_device
-            .iter()
-            .zip(&weights)
-            .map(|(&device, &host)| (device - host).abs())
-            .fold(0.0_f32, f32::max);
+        let max_abs_delta =
+            weights_device.iter().zip(&weights).map(|(&device, &host)| (device - host).abs()).fold(0.0_f32, f32::max);
         if weights_device.len() != weights.len()
             || !max_abs_delta.is_finite()
             || max_abs_delta > RANGER_SMOKE_ABS_TOLERANCE
@@ -17398,13 +17465,18 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         );
     }
     print_startup_kv_colored("upload pipeline", "enabled (2 slots; non-profiled steps)", ConsoleColor::BoldGreen);
+    print_startup_kv_colored(
+        "SFNN L0 backward",
+        args.sfnn_l0_backward.resolved_name(args.arch())?,
+        ConsoleColor::BoldYellow,
+    );
 
     let cuda_shape = initial_weights.shape;
     let ctx = Context::new(device).map_err(|e| e.to_string())?;
     let initial_host_weights = initial_weights.as_host();
     let max_active = feature_kind.max_active();
     let mut runner = match initial_state.optimizer_states.as_ref() {
-        Some(optimizer_states) => SfnnTrainStepRunner::with_optimizer_states_and_factorizer(
+        Some(optimizer_states) => SfnnTrainStepRunner::with_optimizer_states_factorizer_and_l0_backward_selector(
             &ctx,
             initial_host_weights,
             optimizer_states.as_host(),
@@ -17412,14 +17484,16 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             max_active,
             factorizer_active,
             factorizer_alpha,
+            args.sfnn_l0_backward.cuda(),
         ),
-        None => SfnnTrainStepRunner::new_with_factorizer(
+        None => SfnnTrainStepRunner::new_with_factorizer_and_l0_backward_selector(
             &ctx,
             initial_host_weights,
             batch_size,
             max_active,
             factorizer_active,
             factorizer_alpha,
+            args.sfnn_l0_backward.cuda(),
         ),
     }
     .map_err(|e| e.to_string())?;
@@ -17680,7 +17754,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 )?;
 
                 if reject_update {
-                    runner = SfnnTrainStepRunner::with_optimizer_states_and_factorizer(
+                    runner = SfnnTrainStepRunner::with_optimizer_states_factorizer_and_l0_backward_selector(
                         &ctx,
                         cuda_cpp_sfnn_weights_readback_as_host(cuda_shape, &snapshot_weights),
                         cuda_cpp_sfnn_optimizer_readback_as_host(&snapshot_optimizer_states),
@@ -17688,6 +17762,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         max_active,
                         factorizer_active,
                         factorizer_alpha,
+                        args.sfnn_l0_backward.cuda(),
                     )
                     .map_err(|e| e.to_string())?;
                     if let Some((_, _, lambdas)) = sfnn_residual_count_decay.as_ref() {
@@ -21068,8 +21143,9 @@ fn write_sfnn_initial_tensor_report(args: &Args, path: &Path) -> Result<(), Stri
         || args.arch().dims() != (1024, 7, 64)
         || args.effective_layerstack() != Some(LayerStackMode::Kingrank3by3)
     {
-        return Err("--sfnn-initial-tensor-report is fixed to SFNN_halfka2_1024_7_64_k3k3 transform variants"
-            .to_string());
+        return Err(
+            "--sfnn-initial-tensor-report is fixed to SFNN_halfka2_1024_7_64_k3k3 transform variants".to_string()
+        );
     }
     if !effective_sfnn_factorized_l1(args)
         || !effective_sfnn_factorized_l2_l3(args)
@@ -21085,11 +21161,14 @@ fn write_sfnn_initial_tensor_report(args: &Args, path: &Path) -> Result<(), Stri
         for value in values {
             hasher.update(value.to_le_bytes());
         }
-        tensors.insert(name.to_string(), serde_json::json!({
-            "element_count": values.len(),
-            "byte_count": values.len() * std::mem::size_of::<f32>(),
-            "sha256": format!("{:x}", hasher.finalize()),
-        }));
+        tensors.insert(
+            name.to_string(),
+            serde_json::json!({
+                "element_count": values.len(),
+                "byte_count": values.len() * std::mem::size_of::<f32>(),
+                "sha256": format!("{:x}", hasher.finalize()),
+            }),
+        );
     };
     record("l0w", &weights.l0w);
     record("l0b", &weights.l0b);
@@ -21150,8 +21229,7 @@ fn write_sfnn_initial_tensor_report(args: &Args, path: &Path) -> Result<(), Stri
     let temporary = path.with_extension(format!("{}tmp", path.extension().and_then(|v| v.to_str()).unwrap_or("")));
     std::fs::write(&temporary, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
         .map_err(|e| format!("cannot write {}: {e}", temporary.display()))?;
-    std::fs::rename(&temporary, path)
-        .map_err(|e| format!("cannot publish {}: {e}", path.display()))
+    std::fs::rename(&temporary, path).map_err(|e| format!("cannot publish {}: {e}", path.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -21170,13 +21248,16 @@ fn load_cuda_cpp_sfnn_initial_state(
         Some(marker) => {
             return Err(format!(
                 "SFNN state {} band2_block_permute marker {:?} does not match --arch {}",
-                path.display(), marker, args.arch().cli_name()
+                path.display(),
+                marker,
+                args.arch().cli_name()
             ));
         }
         None if requested_transform != PostPairwiseTransform::Identity => {
             return Err(format!(
                 "SFNN state {} has no band2_block_permute marker required by --arch {}",
-                path.display(), args.arch().cli_name()
+                path.display(),
+                args.arch().cli_name()
             ));
         }
         None => {} // Legacy baseline states predate the explicit false marker.
@@ -23712,9 +23793,19 @@ fn write_cuda_cpp_sfnn_nn_bin(
     let mut writer = std::io::BufWriter::new(file);
     let (band_modifier, export_network_hash, mut sfnn_hash) = match shape.post_pairwise_transform {
         bulletou_cuda_cpp::PostPairwiseTransform::Identity => ("", NETWORK_HASH_SFNN, KHASH_SFNN),
-        bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf => (";PairwiseScaleHalf=P63of128", NETWORK_HASH_SFNN_PAIRWISE_SCALE_HALF, KHASH_SFNN_PAIRWISE_SCALE_HALF),
-        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf => (";Band2BlockPermute=K2P63of128RotateLeft1Block4", NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE, KHASH_SFNN_BAND2_BLOCK_PERMUTE),
-        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull => (";Band2BlockPermuteNoHalf=K2P63of128RotateLeft1Block4", NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF, KHASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF),
+        bulletou_cuda_cpp::PostPairwiseTransform::ScaleHalf => {
+            (";PairwiseScaleHalf=P63of128", NETWORK_HASH_SFNN_PAIRWISE_SCALE_HALF, KHASH_SFNN_PAIRWISE_SCALE_HALF)
+        }
+        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateHalf => (
+            ";Band2BlockPermute=K2P63of128RotateLeft1Block4",
+            NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE,
+            KHASH_SFNN_BAND2_BLOCK_PERMUTE,
+        ),
+        bulletou_cuda_cpp::PostPairwiseTransform::Band2RotateFull => (
+            ";Band2BlockPermuteNoHalf=K2P63of128RotateLeft1Block4",
+            NETWORK_HASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF,
+            KHASH_SFNN_BAND2_BLOCK_PERMUTE_NO_HALF,
+        ),
     };
     let arch = format!(
         "ModelType=SFNNWithoutPsqt;Features={}[{}->{}x2],Network=SFNN-{}{{LayerStack={}{}}}",
@@ -25108,6 +25199,10 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_freeze_progress={}", args.sfnn_freeze_progress),
+        format!(
+            "sfnn_l0_backward={}",
+            args.sfnn_l0_backward.resolved_name(args.arch()).unwrap_or("configuration-error")
+        ),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
         format!("test_teacher={test_teacher}"),
         format!("test_positions={test_positions}"),
@@ -25342,8 +25437,26 @@ fn resume_signature_for_match(signature: &str) -> String {
 }
 
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {
+    let stored = if stored.lines().any(|line| line.starts_with("sfnn_l0_backward=")) {
+        stored.to_string()
+    } else {
+        if args.arch().post_pairwise_transform != PostPairwiseTransform::Identity
+            || args.sfnn_l0_backward != SfnnL0BackwardSelectorArg::Auto
+        {
+            return false;
+        }
+        let mut legacy = stored.lines().map(str::to_owned).collect::<Vec<_>>();
+        let insertion = legacy
+            .iter()
+            .position(|line| line.starts_with("sfnn_freeze_progress="))
+            .map_or(legacy.len(), |index| index + 1);
+        legacy.insert(insertion, "sfnn_l0_backward=inverse-index".to_string());
+        let mut legacy = legacy.join("\n");
+        legacy.push('\n');
+        legacy
+    };
     let current = resume_signature_for_match(&resume_signature(args));
-    let stored = resume_signature_for_match(stored);
+    let stored = resume_signature_for_match(&stored);
     if stored.trim_end() == current.trim_end() {
         return true;
     }
@@ -26846,6 +26959,19 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sfnn_l0_backward_selector_table_is_fail_closed() {
+        let identity: NnueArch = "SFNN_halfka2_1024_7_64_k3k3".parse().unwrap();
+        let transformed: NnueArch = "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute".parse().unwrap();
+        assert_eq!(SfnnL0BackwardSelectorArg::Auto.resolved_name(identity).unwrap(), "inverse-index");
+        assert_eq!(
+            SfnnL0BackwardSelectorArg::MaterializedSparse.resolved_name(identity).unwrap(),
+            "materialized-sparse"
+        );
+        assert_eq!(SfnnL0BackwardSelectorArg::Auto.resolved_name(transformed).unwrap(), "materialized-sparse");
+        assert!(SfnnL0BackwardSelectorArg::InverseIndex.resolved_name(transformed).is_err());
+    }
+
     use super::*;
     use std::ffi::OsString;
     use std::str::FromStr;
@@ -26854,18 +26980,9 @@ mod tests {
     fn parses_fixed_post_pairwise_architectures_and_keeps_canonical_names() {
         for (raw, expected) in [
             ("SFNN_halfka2_1024_7_64_k3k3", PostPairwiseTransform::Identity),
-            (
-                "SFNN_halfka2_1024_7_64_k3k3_pairwise_scale_half",
-                PostPairwiseTransform::ScaleHalf,
-            ),
-            (
-                "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute",
-                PostPairwiseTransform::Band2RotateHalf,
-            ),
-            (
-                "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute_no_half",
-                PostPairwiseTransform::Band2RotateFull,
-            ),
+            ("SFNN_halfka2_1024_7_64_k3k3_pairwise_scale_half", PostPairwiseTransform::ScaleHalf),
+            ("SFNN_halfka2_1024_7_64_k3k3_band2_block_permute", PostPairwiseTransform::Band2RotateHalf),
+            ("SFNN_halfka2_1024_7_64_k3k3_band2_block_permute_no_half", PostPairwiseTransform::Band2RotateFull),
         ] {
             let arch = NnueArch::from_str(raw).unwrap();
             assert_eq!(arch.post_pairwise_transform, expected);
@@ -28582,7 +28699,7 @@ mod tests {
         ])
         .unwrap();
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 133_578,
             ft_size: 1024,
             l1_hidden: 8,
@@ -29561,7 +29678,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_factorizer_axis_ids_ignore_progress_axis() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -29598,7 +29715,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_factorizer_axis_ids_include_pair_axes() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -29638,7 +29755,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_residual_count_gate_rebase_preserves_effective_multiplier() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -29678,7 +29795,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_residual_count_gate_rebase_handles_newly_enabled_gate() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 4,
             l1_hidden: 2,
@@ -30822,7 +30939,7 @@ mod tests {
             .unwrap();
 
             let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+                post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
                 input_size: CudaCppSfnnFeatureKind::Halfka2.training_input_size(),
                 ft_size,
                 l1_hidden,
@@ -30898,7 +31015,7 @@ mod tests {
             args.validate_backend_flags().unwrap();
 
             let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+                post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
                 input_size: feature_kind.training_input_size(),
                 ft_size,
                 l1_hidden: 7,
@@ -30934,7 +31051,7 @@ mod tests {
     fn cuda_cpp_sfnn_common_shard_export_allows_inactive_l1_factorizer() {
         let feature_kind = CudaCppSfnnFeatureKind::Halfka2;
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: feature_kind.training_input_size(),
             ft_size: 4,
             l1_hidden: 1,
@@ -31041,7 +31158,7 @@ mod tests {
             args.validate_backend_flags().unwrap();
 
             let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+                post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
                 input_size: CudaCppSfnnFeatureKind::Ka2.training_input_size(),
                 ft_size,
                 l1_hidden: l1_out - 1,
@@ -31310,7 +31427,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_loads_ranger_optimizer_state_records() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31491,7 +31608,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l1f_fold_adds_shared_l1_to_each_stack() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 3,
             l1_hidden: 1,
@@ -31539,7 +31656,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l1f_fold_applies_shared_alpha() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 2,
             ft_size: 2,
             l1_hidden: 1,
@@ -31571,7 +31688,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l2_l3_fold_adds_shared_terms_to_each_stack() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 3,
             l1_hidden: 2,
@@ -31629,7 +31746,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l3_axis_fold_adds_selected_king_axes() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31679,7 +31796,7 @@ mod tests {
     #[test]
     fn cuda_cpp_sfnn_validation_l3_axis_fold_applies_axis_alpha() {
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31742,7 +31859,7 @@ mod tests {
         }
 
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31884,7 +32001,7 @@ mod tests {
         }
 
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -31992,7 +32109,7 @@ mod tests {
         }
 
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
+            post_pairwise_transform: bulletou_cuda_cpp::PostPairwiseTransform::Identity,
             input_size: 4,
             ft_size: 2,
             l1_hidden: 1,
@@ -32425,6 +32542,53 @@ mod tests {
         let legacy = resume_signature(&args).replace("batches_per_update=4", "grad_accum_batches=4");
 
         assert!(resume_signature_matches(&legacy, &args));
+    }
+
+    #[test]
+    fn resume_signature_accepts_only_legacy_auto_l0_backward_path() {
+        use clap::Parser as _;
+
+        let da = Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--teacher", "/dev/null"])
+            .unwrap();
+        let legacy = resume_signature_without_line(&resume_signature(&da), "sfnn_l0_backward=");
+        assert!(resume_signature_matches(&legacy, &da));
+
+        let da_prime = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--sfnn-l0-backward",
+            "materialized-sparse",
+        ])
+        .unwrap();
+        assert!(!resume_signature_matches(&legacy, &da_prime));
+        assert!(!resume_signature_matches(&resume_signature(&da), &da_prime));
+
+        let explicit_inverse = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--sfnn-l0-backward",
+            "inverse-index",
+        ])
+        .unwrap();
+        assert!(!resume_signature_matches(&legacy, &explicit_inverse));
+
+        let transformed_auto = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3_band2_block_permute",
+            "--teacher",
+            "/dev/null",
+        ])
+        .unwrap();
+        let transformed_legacy =
+            resume_signature_without_line(&resume_signature(&transformed_auto), "sfnn_l0_backward=");
+        assert!(!resume_signature_matches(&transformed_legacy, &transformed_auto));
     }
 
     #[test]
@@ -34320,8 +34484,14 @@ mod tests {
 
     #[test]
     fn all_post_pairwise_hashes_follow_xor_contract_and_fail_closed() {
-        let baseline =
-            NnueArch::new(NnueArchFamily::Sfnn, NnueArchFeature::Halfka2, 1024, 7, 64, Some(LayerStackMode::Kingrank3by3));
+        let baseline = NnueArch::new(
+            NnueArchFamily::Sfnn,
+            NnueArchFeature::Halfka2,
+            1024,
+            7,
+            64,
+            Some(LayerStackMode::Kingrank3by3),
+        );
         let arches: Vec<_> = [
             PostPairwiseTransform::Identity,
             PostPairwiseTransform::ScaleHalf,
@@ -34331,10 +34501,8 @@ mod tests {
         .into_iter()
         .map(|post_pairwise_transform| NnueArch { post_pairwise_transform, ..baseline })
         .collect();
-        let models: Vec<_> = arches
-            .iter()
-            .map(|&arch| fake_sfnn_nn_bin(arch, LayerStackMode::Kingrank3by3.num_stacks()))
-            .collect();
+        let models: Vec<_> =
+            arches.iter().map(|&arch| fake_sfnn_nn_bin(arch, LayerStackMode::Kingrank3by3.num_stacks())).collect();
 
         for (model_index, model) in models.iter().enumerate() {
             for (engine_index, &arch) in arches.iter().enumerate() {

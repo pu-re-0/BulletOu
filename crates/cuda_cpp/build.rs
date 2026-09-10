@@ -16,13 +16,21 @@ fn cuda_path() -> PathBuf {
         }
     }
 
-    panic!("CUDA_PATH is not set; install the NVIDIA CUDA Toolkit or set CUDA_PATH to its install directory");
+    if !cfg!(target_os = "windows") {
+        let conventional = PathBuf::from("/usr/local/cuda");
+        if conventional.exists() {
+            return conventional;
+        }
+    }
+
+    panic!("CUDA Toolkit was not found; install it under /usr/local/cuda or set CUDA_PATH to its install directory");
 }
 
 fn main() {
     let cuda = cuda_path();
     let include = cuda.join("include");
     let lib_dir = if cfg!(target_os = "windows") { cuda.join("lib/x64") } else { cuda.join("lib64") };
+    let nvcc = cuda.join("bin/nvcc");
 
     if !include.exists() {
         panic!("CUDA include directory does not exist: {}", include.display());
@@ -32,12 +40,18 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=cpp/bulletou_cuda_backend.cu");
+    println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
 
     let mut build = cc::Build::new();
     build.cuda(true);
+    if env::var_os("NVCC").is_none() && nvcc.is_file() {
+        // SAFETY: Cargo build scripts are separate, single-threaded processes;
+        // this only selects cc-rs' CUDA compiler before compilation starts.
+        unsafe { env::set_var("NVCC", nvcc) };
+    }
     build.cudart("shared");
     build.cargo_warnings(false);
     build.include(include);
