@@ -806,11 +806,10 @@ fn validate_gate0_evidence(spec: &Spec) -> Result<(), String> {
     }
     let report: Value =
         serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    if report["schema_version"] != "issue13-gate0-v2"
-        || report["binary_sha256"] != spec.binary_sha256
-        || report["passed"] != true
-        || !report["typed_stop"].is_null()
-    {
+    if report["binary_sha256"] != spec.binary_sha256 {
+        return Err("DATA_INTEGRITY_STOP: Gate 0 binary differs".into());
+    }
+    if report["schema_version"] != "issue13-gate0-v2" || report["passed"] != true || !report["typed_stop"].is_null() {
         return Err("IMPLEMENTATION_STOP: Gate 0 did not pass on this binary".into());
     }
     let dispatch: Value = serde_json::from_slice(
@@ -1084,6 +1083,26 @@ fn gate1(args: &super::Args, spec: &Spec) -> Result<Value, String> {
     )
 }
 
+fn stop_kind(error: &str) -> &'static str {
+    for kind in [
+        "CONFIGURATION_STOP",
+        "DATA_INTEGRITY_STOP",
+        "IMPLEMENTATION_STOP",
+        "RESOURCE_STOP",
+        "SCIENTIFIC_GATE_FAIL",
+        "SEALED_POLICY_STOP",
+    ] {
+        if error.starts_with(kind) {
+            return kind;
+        }
+    }
+    let lower = error.to_lowercase();
+    if lower.contains("out of memory") || lower.contains("memory allocation") {
+        "RESOURCE_STOP"
+    } else {
+        "IMPLEMENTATION_STOP"
+    }
+}
 pub fn run(args: &super::Args, path: &Path) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|e| format!("DATA_INTEGRITY_STOP: {e}"))?;
     let spec: Spec = serde_json::from_slice(&bytes).map_err(|e| format!("CONFIGURATION_STOP: {e}"))?;
@@ -1144,7 +1163,7 @@ pub fn run(args: &super::Args, path: &Path) -> Result<(), String> {
     let mut report = match result {
         Ok(v) => v,
         Err(e) => {
-            json!({"schema_version":if spec.stage=="gate0"{"issue13-gate0-v2"}else{"issue13-gate1-v2"},"passed":false,"typed_stop":if e.contains("RESOURCE_STOP") || e.to_lowercase().contains("out of memory") || e.to_lowercase().contains("memory allocation"){"RESOURCE_STOP"}else if e.contains("DATA_INTEGRITY_STOP"){"DATA_INTEGRITY_STOP"}else{"IMPLEMENTATION_STOP"},"error":e})
+            json!({"schema_version":if spec.stage=="gate0"{"issue13-gate0-v2"}else{"issue13-gate1-v2"},"passed":false,"typed_stop":stop_kind(&e),"error":e})
         }
     };
     report["preregistration_sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
@@ -1268,6 +1287,21 @@ mod tests {
             "roundtrip_sha256":actual,"updates":0,"passed":expected==actual})
         );
         assert_eq!(expected, actual, "disk loader/GPU upload/readback/state writer changed checkpoint bytes");
+    }
+    #[test]
+    fn stage_errors_preserve_all_typed_stop_classes() {
+        for kind in [
+            "CONFIGURATION_STOP",
+            "DATA_INTEGRITY_STOP",
+            "IMPLEMENTATION_STOP",
+            "RESOURCE_STOP",
+            "SCIENTIFIC_GATE_FAIL",
+            "SEALED_POLICY_STOP",
+        ] {
+            assert_eq!(stop_kind(&format!("{kind}: fixture error")), kind);
+        }
+        assert_eq!(stop_kind("CUDA out of memory"), "RESOURCE_STOP");
+        assert_eq!(stop_kind("unexpected parameter mismatch"), "IMPLEMENTATION_STOP");
     }
     #[test]
     fn duplicate_feature_rejected() {
