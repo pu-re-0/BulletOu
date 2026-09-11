@@ -871,6 +871,16 @@ fn validate_gate0_evidence(spec: &Spec) -> Result<(), String> {
     }
     Ok(())
 }
+fn resume_identity(step: usize, batches: usize) -> Value {
+    json!({"completed_steps":step,"optimizer_steps":step,"lr":0.000875,
+           "next_batch":step%batches,"rng_seed":SEED,"runtime_rng_draws":0,"pending_gradients":false})
+}
+fn validate_resume_identity(value: &Value, step: usize, batches: usize) -> Result<(), String> {
+    if value != &resume_identity(step, batches) {
+        return Err("DATA_INTEGRITY_STOP: checkpoint scheduler/RNG/cursor state differs".into());
+    }
+    Ok(())
+}
 fn gate1(args: &super::Args, spec: &Spec) -> Result<Value, String> {
     validate_gate0_evidence(spec)?;
     let seq = batches(spec)?;
@@ -911,6 +921,7 @@ fn gate1(args: &super::Args, spec: &Spec) -> Result<Value, String> {
             }
             let row: Value = serde_json::from_slice(&fs::read(dir.join("metadata.json")).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
+            validate_resume_identity(&row["resume"], n, seq.len())?;
             let expected_batches: Vec<Value> =
                 (1..=n).map(|step| json!({"step":step,"batch_sha256":digest_json(&seq[(step-1)%seq.len()])})).collect();
             if row["spec_sha256"] != digest_json(spec)
@@ -1015,7 +1026,7 @@ fn gate1(args: &super::Args, spec: &Spec) -> Result<Value, String> {
                     let delta: Vec<f32> = after.iter().zip(prev).map(|(a, b)| a - b).collect();
                     updates.insert(name, stats(&delta)?);
                 }
-                let row = json!({"spec_sha256":digest_json(spec),"step":n,"arm":arm,"resolved_path":format!("{:?}",r.l0_backward_path()),"initial_state_sha256":digest_json(&identity),"initial_state":identity,"batch_sequence_sha256":digest_json(&consumed),"consumed_batches":consumed,"state_sha256":file_hash(&temp.join("state.bin"))?,"weights":tensor_stats(weights_map(&weights))?,"gradients":gradient_stats,"updates":updates,"post_pairwise":stats(&trace.combined)?,"float_output":stats(&trace.output)?,"float_outputs":trace.output,"quantized":quantized,"timing":{"checkpoint_step_gpu_ms":timing.total_ms,"forward_ms":timing.forward_ms,"backward_ms":timing.backward_ms,"l0_ms":timing.backward_stages.l0_ms,"pairwise_kernel_ms":timing.backward_stages.pairwise_ms,"sparse_l0_kernel_ms":timing.backward_stages.sparse_l0_ms,"l1_ms":timing.backward_stages.l1_ms,"l2_ms":timing.backward_stages.l2_ms,"l3_ms":timing.backward_stages.l3_ms,"update_ms":timing.update_ms,"total_gpu_ms":total_kernel_ms,"wall_seconds":arm_started.elapsed().as_secs_f64(),"profiled_positions_per_second":(n*b.size()) as f64/(total_kernel_ms/1000.0)},"resume":{"completed_steps":n,"optimizer_steps":n,"lr":0.000875,"next_batch":n%seq.len(),"rng_seed":SEED,"runtime_rng_draws":0,"pending_gradients":false},"clean_completion":true});
+                let row = json!({"spec_sha256":digest_json(spec),"step":n,"arm":arm,"resolved_path":format!("{:?}",r.l0_backward_path()),"initial_state_sha256":digest_json(&identity),"initial_state":identity,"batch_sequence_sha256":digest_json(&consumed),"consumed_batches":consumed,"state_sha256":file_hash(&temp.join("state.bin"))?,"weights":tensor_stats(weights_map(&weights))?,"gradients":gradient_stats,"updates":updates,"post_pairwise":stats(&trace.combined)?,"float_output":stats(&trace.output)?,"float_outputs":trace.output,"quantized":quantized,"timing":{"checkpoint_step_gpu_ms":timing.total_ms,"forward_ms":timing.forward_ms,"backward_ms":timing.backward_ms,"l0_ms":timing.backward_stages.l0_ms,"pairwise_kernel_ms":timing.backward_stages.pairwise_ms,"sparse_l0_kernel_ms":timing.backward_stages.sparse_l0_ms,"l1_ms":timing.backward_stages.l1_ms,"l2_ms":timing.backward_stages.l2_ms,"l3_ms":timing.backward_stages.l3_ms,"update_ms":timing.update_ms,"total_gpu_ms":total_kernel_ms,"wall_seconds":arm_started.elapsed().as_secs_f64(),"profiled_positions_per_second":(n*b.size()) as f64/(total_kernel_ms/1000.0)},"resume":resume_identity(n,seq.len()),"clean_completion":true});
                 publish(&temp.join("metadata.json"), &row)?;
                 fs::rename(&temp, arm_dir.join(n.to_string())).map_err(|e| e.to_string())?;
                 saved.insert(n.to_string(), row);
@@ -1076,6 +1087,9 @@ fn gate1(args: &super::Args, spec: &Spec) -> Result<Value, String> {
 pub fn run(args: &super::Args, path: &Path) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|e| format!("DATA_INTEGRITY_STOP: {e}"))?;
     let spec: Spec = serde_json::from_slice(&bytes).map_err(|e| format!("CONFIGURATION_STOP: {e}"))?;
+    if spec.sealed_test {
+        return Err("SEALED_POLICY_STOP: qualification cannot use sealed test".into());
+    }
     if spec.schema_version != "issue13-qualification-v2"
         || !["gate0", "gate1"].contains(&spec.stage.as_str())
         || spec.seed != SEED
@@ -1083,7 +1097,6 @@ pub fn run(args: &super::Args, path: &Path) -> Result<(), String> {
         || spec.absolute_tolerance != ATOL
         || spec.relative_tolerance != RTOL
         || spec.fixtures != FIXTURES
-        || spec.sealed_test
         || args.arch().cli_name() != "SFNN_halfka2_1024_7_64_k3k3"
         || !super::effective_sfnn_factorizer_spec(args).shared
     {
@@ -1155,6 +1168,107 @@ pub fn run(args: &super::Args, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resume_rejects_changed_scheduler_rng_and_cursor() {
+        let original = resume_identity(10, 4);
+        assert!(validate_resume_identity(&original, 10, 4).is_ok());
+        for (field, value) in [
+            ("lr", json!(0.1)),
+            ("rng_seed", json!(0)),
+            ("runtime_rng_draws", json!(1)),
+            ("next_batch", json!(3)),
+            ("optimizer_steps", json!(9)),
+            ("pending_gradients", json!(true)),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            assert!(validate_resume_identity(&changed, 10, 4).unwrap_err().contains("DATA_INTEGRITY_STOP"));
+        }
+    }
+    #[test]
+    fn sealed_registration_stops_before_input_or_cuda_access() {
+        let path = std::env::temp_dir().join(format!("issue13-sealed-{}.json", std::process::id()));
+        let value = json!({"schema_version":"issue13-qualification-v2","stage":"gate0",
+            "teacher":"nonexistent-input","teacher_sha256":"invalid","binary_sha256":"invalid",
+            "output":"unused-output","seed":SEED,"repetitions":2,"absolute_tolerance":ATOL,
+            "relative_tolerance":RTOL,"fixtures":FIXTURES,"sealed_test":true,"provenance":{}});
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        file.write_all(&serde_json::to_vec(&value).unwrap()).unwrap();
+        drop(file);
+        let args = crate::Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--backend",
+            "cuda-cpp",
+            "--teacher",
+            "nonexistent-input",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+        let error = run(&args, &path).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(error.starts_with("SEALED_POLICY_STOP"), "{error}");
+    }
+    #[test]
+    #[ignore = "requires CUDA and explicit ISSUE13_ROUNDTRIP_STATE checkpoint"]
+    fn production_checkpoint_cuda_roundtrip_is_bitwise() {
+        let source = PathBuf::from(std::env::var_os("ISSUE13_ROUNDTRIP_STATE").expect("checkpoint required"));
+        let expected = file_hash(&source).unwrap();
+        let args = crate::Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--backend",
+            "cuda-cpp",
+            "--teacher",
+            "unused",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "shared",
+        ])
+        .unwrap();
+        let loaded =
+            crate::load_cuda_cpp_sfnn_initial_state(&source, &args, crate::CudaCppSfnnFeatureKind::Halfka2).unwrap();
+        let n = loaded.completed_steps;
+        assert_eq!(n, 10, "this check targets the planned step-10 restart");
+        assert_eq!(loaded.optimizer_steps, n);
+        let ctx = Context::new(0).unwrap();
+        let batch = Batch {
+            stm: vec![-1; 16],
+            nstm: vec![-1; 16],
+            buckets: vec![0; 16],
+            targets: vec![0.5; 16],
+            weights: vec![1.0; 16],
+            max_active: 1,
+        };
+        let mut r = runner(&ctx, loaded.weights.as_host(), &batch, SfnnL0BackwardSelector::Auto).unwrap();
+        r.upload_state_from_host(
+            &ctx,
+            loaded.weights.as_host(),
+            loaded.optimizer_states.as_ref().unwrap().as_host(),
+            SfnnFactorizerActive { shared: true, ..SfnnFactorizerActive::NONE },
+            SfnnFactorizerAlpha::ONE,
+        )
+        .unwrap();
+        drop(loaded);
+        let w = r.read_weights(&ctx).unwrap();
+        let o = r.read_optimizer_states(&ctx).unwrap();
+        drop(r);
+        let target = std::env::temp_dir().join(format!("issue13-roundtrip-{}.bin", std::process::id()));
+        assert!(!target.exists());
+        crate::write_cuda_cpp_sfnn_weights_bin(&target, &w, PostPairwiseTransform::Identity, &o, None, n, n).unwrap();
+        let actual = file_hash(&target).unwrap();
+        fs::remove_file(target).unwrap();
+        println!(
+            "{}",
+            json!({"check":"checkpoint-cuda-roundtrip","source_sha256":expected,
+            "roundtrip_sha256":actual,"updates":0,"passed":expected==actual})
+        );
+        assert_eq!(expected, actual, "disk loader/GPU upload/readback/state writer changed checkpoint bytes");
+    }
     #[test]
     fn duplicate_feature_rejected() {
         let b = Batch {
