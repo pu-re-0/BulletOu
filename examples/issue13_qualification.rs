@@ -1334,3 +1334,12 @@ mod tests {
         assert!(metric(&[f32::NAN], &[0.0], vec![1]).is_err());
     }
 }
+
+#[path = "issue16_diagnostic.rs"]
+pub mod issue16;
+
+#[path = "issue16_trajectory.rs"]
+mod issue16_trajectory;
+
+#[path = "issue16_compare.rs"]
+mod issue16_compare;

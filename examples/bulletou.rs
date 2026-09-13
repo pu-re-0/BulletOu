@@ -4591,6 +4591,10 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     issue13_qualification: Option<PathBuf>,
 
+    /// Explicit Issue #16 diagnostic registration; never ordinary resume.
+    #[arg(long, value_name = "PATH", conflicts_with = "issue13_qualification")]
+    issue16_diagnostic: Option<PathBuf>,
+
     /// Atomically publish the Issue #13 Gate 0 report.
     #[arg(long, value_name = "PATH", requires = "issue13_gate0_fixtures")]
     issue13_gate0_report: Option<PathBuf>,
@@ -5303,7 +5307,7 @@ impl Args {
     }
 
     fn validate_cuda_cpp_backend_options(&self) -> Result<(), String> {
-        if self.issue13_qualification.is_some()
+        if (self.issue13_qualification.is_some() || self.issue16_diagnostic.is_some())
             && (self.cuda_cpp_train_steps != Some(1)
                 || self.cuda_cpp_smoke
                 || self.initial_state.is_some()
@@ -5311,7 +5315,7 @@ impl Args {
                 || self.sfnn_l0_backward != SfnnL0BackwardSelectorArg::Auto
                 || self.arch().cli_name() != "SFNN_halfka2_1024_7_64_k3k3")
         {
-            return Err("Issue #13 qualification requires fixed identity CUDA direct entry, one dispatch step, and no external resume/initial state".into());
+            return Err("CONFIGURATION_STOP: Issue #13/#16 diagnostics require fixed identity CUDA direct entry, one dispatch step, and no external resume/initial state".into());
         }
 
         if !cfg!(feature = "cuda-cpp-backend") {
@@ -12558,6 +12562,16 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
+    // Diagnostics own their dispatch and output identity. Do not touch ordinary
+    // training resume/tag/build-info files before validating their registration.
+    #[cfg(feature = "cuda-cpp-backend")]
+    if let Some(path) = &args.issue16_diagnostic {
+        if let Err(e) = issue13_qualification::issue16::run(path) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return;
+    }
     #[cfg(feature = "cuda-cpp-backend")]
     if let Err(e) = resolve_value_loss_runtime_params(&args) {
         eprintln!("error: {e}");
@@ -17107,6 +17121,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     use bulletou_lib::value::SfnnTeacherBatchConfig;
     use sha2::{Digest as _, Sha256};
 
+    if let Some(spec) = &args.issue16_diagnostic {
+        return issue13_qualification::issue16::run(spec);
+    }
     if let Some(spec) = &args.issue13_qualification {
         return issue13_qualification::run(args, spec);
     }
