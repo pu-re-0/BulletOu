@@ -2,7 +2,8 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn git_output(args: &[&str]) -> Option<String> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
-    let output = Command::new("git").arg("-C").arg(manifest_dir).args(args).output().ok()?;
+    let output =
+        Command::new("git").env("GIT_OPTIONAL_LOCKS", "0").arg("-C").arg(manifest_dir).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -15,12 +16,22 @@ fn emit_git_rerun_hints() {
         return;
     };
     let root = PathBuf::from(manifest_dir).join("../..");
-    let git_dir = root.join(".git");
-    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
-        if let Some(reference) = head.trim().strip_prefix("ref: ") {
-            println!("cargo:rerun-if-changed={}", git_dir.join(reference).display());
+    // A submodule/worktree has a .git file, not a .git directory.
+    // Resolve HEAD and refs through Git so commit changes invalidate the cache.
+    if let Some(dir) = git_output(&["rev-parse", "--absolute-git-dir"]) {
+        let git_dir = PathBuf::from(dir);
+        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+        println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
+        if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
+            if let Some(reference) = head.trim().strip_prefix("ref: ") {
+                if let Some(path) = git_output(&["rev-parse", "--path-format=absolute", "--git-path", reference]) {
+                    println!("cargo:rerun-if-changed={path}");
+                }
+            }
         }
+    }
+    for path in ["Cargo.toml", "Cargo.lock", "examples", "crates"] {
+        println!("cargo:rerun-if-changed={}", root.join(path).display());
     }
 }
 
@@ -38,6 +49,7 @@ fn main() {
     let dirty = env::var("BULLETOU_GIT_DIRTY")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| git_output(&["status", "--porcelain"]).map(|s| (!s.is_empty()).to_string()))
         .unwrap_or_else(|| "unknown".to_string());
     let profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
